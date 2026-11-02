@@ -50,6 +50,59 @@ const app = {
       $('tts-voice-tip').textContent = '当前浏览器不支持语音朗读，建议用 Chrome / Edge / Safari 打开';
     }
 
+    // 安卓 APP：原生 TTS 状态显示 —— 拉模式（随时同步 getDiag()，无时序竞争）
+    if (isNativeApp()) {
+      const ttsTip = () => {
+        const tip = $('tts-voice-tip');
+        if (!tip) return;
+        let d = null;
+        try { d = JSON.parse(window.AndroidTTS.getDiag() || '{}'); } catch (e) { /* ignore */ }
+        if (!d) return;
+        const act = `style="color:#4a63d9;font-weight:600"`;
+        const ver = d.ver ? ` <span style="opacity:.55;font-size:11px">轻阅 ${d.ver}</span>` : '';
+        if (d.builtinReady) {
+          tip.innerHTML = `当前语音引擎：<b>${escapeHtml(d.engine || '内置离线语音')}</b>（内置·离线可用） · ` +
+            `<a href="javascript:void(0)" data-tts-act="test" ${act}>试听</a>` + ver;
+        } else if (d.builtinErr) {
+          tip.innerHTML = `⚠️ 内置语音引擎加载失败：<b>${escapeHtml(String(d.builtinErr).slice(0, 140))}</b> · ` +
+            `<a href="javascript:void(0)" data-tts-act="refresh" ${act}>重新加载</a>` + ver;
+        } else if (d.zh) {
+          tip.innerHTML = `当前语音引擎：<b>${escapeHtml(d.engine || '系统默认')}</b>` +
+            `${d.voices ? `（${d.voices} 个音色）` : ''} · ` +
+            `<a href="javascript:void(0)" data-tts-act="choose" ${act}>更换引擎</a> · ` +
+            `<a href="javascript:void(0)" data-tts-act="test" ${act}>试听</a>` + ver;
+        } else {
+          tip.innerHTML = `⚠️ 当前引擎 <b>${escapeHtml(d.engine || '系统默认')}</b> 未检测到中文语音。` +
+            `<a href="javascript:void(0)" data-tts-act="choose" ${act}>更换引擎</a> 或 ` +
+            `<a href="javascript:void(0)" data-tts-act="market" ${act}>去应用商店安装中文语音包</a>（讯飞语记 / Google 文字转语音等），` +
+            `装好后点 <a href="javascript:void(0)" data-tts-act="refresh" ${act}>重新检测</a>，再 <a href="javascript:void(0)" data-tts-act="test" ${act}>试听</a> 验证` + ver;
+        }
+        tip.querySelectorAll('[data-tts-act]').forEach(a => {
+          a.addEventListener('click', () => {
+            const act2 = a.dataset.ttsAct;
+            try {
+              if (act2 === 'choose') window.AndroidTTS.chooseEngine();
+              else if (act2 === 'settings') window.AndroidTTS.openTtsSettings();
+              else if (act2 === 'market') { this.toast('安装中文语音引擎后回来点「重新检测」'); window.AndroidTTS.openMarket(); }
+              else if (act2 === 'refresh') { this.toast('正在重新加载语音引擎…'); window.AndroidTTS.reinit(); }
+              else if (act2 === 'test') { this.toast('正在试听…'); window.AndroidTTS.testSpeak(); }
+            } catch (e) { /* ignore */ }
+          });
+        });
+        if (d.builtinReady) this.fillVoices();
+      };
+      window.__ttsState = () => ttsTip();
+      window.__ttsTest = ok => {
+        this.toast(ok ? '✅ 试听成功，可以正常听书了' : '❌ 试听失败，请看提示行说明');
+        ttsTip();
+      };
+      window.__renderTtsTip = ttsTip;
+      // 首次渲染；内置引擎模型是异步加载的（1~2 秒），加载前后多刷几次确保提示跟上
+      ttsTip();
+      setTimeout(ttsTip, 800);
+      setTimeout(ttsTip, 2500);
+    }
+
     // 安卓 APP 环境适配：返回键接管、隐藏「添加到桌面」引导
     this.setupNativeHooks();
   },
@@ -146,12 +199,67 @@ const app = {
 
   /* ================= 导入 ================= */
   bindImport() {
-    $('btn-import').addEventListener('click', () => $('file-input').click());
-    $('file-input').addEventListener('change', async e => {
+    const input = $('file-input');
+    const canNative = () => !!(window.AndroidFile && typeof window.AndroidFile.pickFiles === 'function');
+
+    $('btn-import').addEventListener('click', () => {
+      if (canNative()) {
+        try {
+          this.toast('正在打开文件选择器…');
+          window.AndroidFile.pickFiles();   // 原生 SAF 选择器（APP 主通道）
+          return;
+        } catch (e) {
+          console.warn('native pick failed, fallback', e);
+        }
+      }
+      input.click();                        // 网页兜底
+    });
+
+    input.addEventListener('change', async e => {
       const files = Array.from(e.target.files || []);
       e.target.value = '';
       if (files.length) await this.importFiles(files);
     });
+
+    /* 原生 APP：系统选择器返回后，把 content:// 文件从虚拟域取回来 */
+    window.__onFilesPickedB64 = async b64 => {
+      const mask = $('loading-mask'), text = $('loading-text');
+      try {
+        const json = new TextDecoder().decode(Uint8Array.from(atob(b64), c => c.charCodeAt(0)));
+        const list = JSON.parse(json);
+        const files = [];
+        for (let i = 0; i < list.length; i++) {
+          const it = list[i];
+          const name = this.pickName(it.name, it.mime);
+          text.textContent = `正在读取 ${name}（${i + 1}/${list.length}）`;
+          mask.classList.add('show');
+          const buf = await this.fetchNativeFile(it.uri);
+          if (!buf) { this.toast(`${name} 读取失败`); continue; }
+          files.push(new File([buf], name, { type: it.mime || 'application/octet-stream' }));
+        }
+        mask.classList.remove('show');
+        if (files.length) await this.importFiles(files);
+      } catch (err) {
+        mask.classList.remove('show');
+        console.error(err);
+        this.toast('导入失败：' + (err.message || '无法读取所选文件'));
+      }
+    };
+  },
+
+  async fetchNativeFile(uri) {
+    const res = await fetch('/__local__/?u=' + encodeURIComponent(uri));
+    if (!res.ok) return null;
+    return await res.arrayBuffer();
+  },
+
+  /** 系统选择器给出的文件名可能缺后缀，补一个以便正确识别 EPUB */
+  pickName(name, mime) {
+    let n = (name || '').trim() || '未命名.txt';
+    if (!/\.[a-z0-9]+$/i.test(n)) {
+      n += (mime && /epub|zip/i.test(mime)) ? '.epub' : '.txt';
+    }
+    return n;
   },
 
   async importFiles(files) {
@@ -377,14 +485,18 @@ const app = {
     const opts = reader.speaker.voiceOptions();
     sel.innerHTML = '';
     if (!opts.length) {
-      sel.innerHTML = '<option value="">（系统暂无可用音色）</option>';
+      sel.innerHTML = '<option value="">（使用系统默认音色）</option>';
       return;
     }
     for (const v of opts) {
       const o = document.createElement('option');
       o.value = v.voiceURI;
-      const local = v.localService ? '本地' : '云端';
-      o.textContent = `${v.name} · ${v.lang}${local ? ' · ' + local : ''}`;
+      if (v.name === '系统默认音色' || v.voiceURI === '系统默认音色') {
+        o.textContent = '系统默认音色（未检测到其它音色，仍可朗读）';
+      } else {
+        const local = v.localService ? '本地' : '云端';
+        o.textContent = `${v.name} · ${v.lang}${local ? ' · ' + local : ''}`;
+      }
       sel.appendChild(o);
     }
     if (settings.ttsVoice && opts.some(v => v.voiceURI === settings.ttsVoice)) sel.value = settings.ttsVoice;
@@ -486,6 +598,7 @@ const app = {
   openSheet(id) {
     document.querySelectorAll('.sheet').forEach(s => s.classList.remove('open'));
     $(id).classList.add('open');
+    if (id === 'sheet-tts' && isNativeApp() && window.__renderTtsTip) window.__renderTtsTip();
   },
   closeSheets() {
     document.querySelectorAll('.sheet').forEach(s => s.classList.remove('open'));
