@@ -231,10 +231,14 @@ const app = {
         for (let i = 0; i < list.length; i++) {
           const it = list[i];
           const name = this.pickName(it.name, it.mime);
-          text.textContent = `正在读取 ${name}（${i + 1}/${list.length}）`;
+          const mb = it.size ? (it.size / 1048576).toFixed(1) : '?';
+          text.textContent = `正在读取 ${name}（${mb} MB，${i + 1}/${list.length}）`;
           mask.classList.add('show');
-          const buf = await this.fetchNativeFile(it.uri);
-          if (!buf) { this.toast(`${name} 读取失败`); continue; }
+          if (it.size > 60 * 1048576) {
+            this.toast(`${name} 超过 60 MB，导入可能因内存不足失败`);
+          }
+          const buf = await this.fetchNativeFile(it);
+          if (!buf || !buf.byteLength) { this.toast(`${name} 读取失败`); continue; }
           files.push(new File([buf], name, { type: it.mime || 'application/octet-stream' }));
         }
         mask.classList.remove('show');
@@ -247,8 +251,10 @@ const app = {
     };
   },
 
-  async fetchNativeFile(uri) {
-    const res = await fetch('/__local__/?u=' + encodeURIComponent(uri));
+  async fetchNativeFile(it) {
+    // 优先用原生侧复制到应用缓存的副本（f），避免 content:// 授权失效
+    const q = it.f ? ('f=' + encodeURIComponent(it.f)) : ('u=' + encodeURIComponent(it.uri));
+    const res = await fetch('/__local__/?' + q);
     if (!res.ok) return null;
     return await res.arrayBuffer();
   },
