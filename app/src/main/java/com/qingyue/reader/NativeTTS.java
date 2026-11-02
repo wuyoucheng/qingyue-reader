@@ -185,12 +185,114 @@ public class NativeTTS {
         return s == null ? "" : s.replace("\\", "\\\\").replace("'", "\\'");
     }
 
+    /** 试听结果回调 JS：window.__ttsTest(ok) */
+    private void fireTest(final boolean ok) {
+        main.post(() -> {
+            if (webView == null) return;
+            webView.evaluateJavascript("window.__ttsTest&&window.__ttsTest(" + ok + ")", null);
+        });
+    }
+
+    /** 试读一句，验证当前引擎是否真的能出声 */
+    @JavascriptInterface
+    public void testSpeak() {
+        main.post(() -> {
+            if (tts == null || !ready) { fireTest(false); return; }
+            try {
+                tts.setSpeechRate(rate);
+                tts.setPitch(pitch);
+                Bundle params = new Bundle();
+                params.putString(TextToSpeech.Engine.KEY_PARAM_UTTERANCE_ID, "test");
+                int r = tts.speak("你好，这是轻阅读书的语音试听。", TextToSpeech.QUEUE_FLUSH, params, "test");
+                if (r != TextToSpeech.SUCCESS) fireTest(false);
+            } catch (Exception e) {
+                fireTest(false);
+            }
+        });
+    }
+
+    /** 列出已安装的 TTS 引擎 JSON：[{name,label}] */
+    @JavascriptInterface
+    public String getEngines() {
+        try {
+            JSONArray arr = new JSONArray();
+            if (tts != null) {
+                List<TextToSpeech.EngineInfo> list = tts.getEngines();
+                if (list != null) {
+                    for (TextToSpeech.EngineInfo ei : list) {
+                        JSONObject o = new JSONObject();
+                        o.put("name", ei.name);
+                        o.put("label", ei.label == null || ei.label.isEmpty() ? ei.name : ei.label);
+                        arr.put(o);
+                    }
+                }
+            }
+            return arr.toString();
+        } catch (Exception e) {
+            return "[]";
+        }
+    }
+
+    /** 切换到指定引擎（异步重建，完成后推 __ttsState） */
+    @JavascriptInterface
+    public void useEngine(final String name) {
+        if (name == null || name.isEmpty()) return;
+        main.post(() -> {
+            if (name.equals(engineName)) return;
+            try { if (tts != null) { tts.stop(); tts.shutdown(); } } catch (Exception ignore) {}
+            tts = null;
+            initEngine(name);
+        });
+    }
+
+    /** 弹出系统风格的单选对话框让用户挑引擎 */
+    @JavascriptInterface
+    public void chooseEngine() {
+        main.post(() -> {
+            try {
+                List<TextToSpeech.EngineInfo> list = tts != null ? tts.getEngines() : null;
+                if (list == null || list.isEmpty()) { fireTest(false); return; }
+                final String[] names = new String[list.size()];
+                final String[] labels = new String[list.size()];
+                int cur = 0;
+                for (int i = 0; i < list.size(); i++) {
+                    names[i] = list.get(i).name;
+                    labels[i] = (list.get(i).label == null || list.get(i).label.isEmpty()
+                            ? list.get(i).name : list.get(i).label)
+                            + (names[i].equals(engineName) ? "（当前）" : "");
+                    if (names[i].equals(engineName)) cur = i;
+                }
+                new android.app.AlertDialog.Builder(activity)
+                        .setTitle("选择语音引擎")
+                        .setSingleChoiceItems(labels, cur, (d, w) -> {
+                            d.dismiss();
+                            if (names[w] != null && !names[w].equals(engineName)) {
+                                useEngine(names[w]);
+                            }
+                        })
+                        .setNegativeButton("取消", null)
+                        .show();
+            } catch (Exception e) {
+                Log.w(TAG, "chooseEngine: " + e.getMessage());
+            }
+        });
+    }
+
     /* ---------------- 朗读事件 ---------------- */
 
     private final UtteranceProgressListener progressListener = new UtteranceProgressListener() {
-        @Override public void onStart(String utteranceId) { fire("start", utteranceId); }
-        @Override public void onDone(String utteranceId) { fire("done", utteranceId); }
-        @Override public void onError(String utteranceId) { fire("error", utteranceId); }
+        @Override public void onStart(String utteranceId) {
+            if ("test".equals(utteranceId)) return;
+            fire("start", utteranceId);
+        }
+        @Override public void onDone(String utteranceId) {
+            if ("test".equals(utteranceId)) { fireTest(true); return; }
+            fire("done", utteranceId);
+        }
+        @Override public void onError(String utteranceId) {
+            if ("test".equals(utteranceId)) { fireTest(false); return; }
+            fire("error", utteranceId);
+        }
     };
 
     private void fire(String type, String id) {
