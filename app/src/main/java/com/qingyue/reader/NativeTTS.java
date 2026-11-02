@@ -54,7 +54,9 @@ public class NativeTTS {
     /* 内置离线引擎（sherpa-onnx + 小燕中文女声）：优先使用 */
     private final OfflineTtsEngine builtin = new OfflineTtsEngine();
     private volatile boolean builtinReady = false;
+    private volatile String builtinErr = "";   // 内置引擎初始化失败原因（诊断用）
     private static final String BUILTIN_NAME = "小燕 · 离线女声";
+    private static final String APP_VER = "v1.6";
 
     public NativeTTS(Activity activity, WebView webView) {
         this.activity = activity;
@@ -63,19 +65,59 @@ public class NativeTTS {
 
         // 内置引擎在后台加载模型（不阻塞 UI），成功后接管朗读
         new Thread(() -> {
-            boolean ok = builtin.init(appContext);
+            boolean ok;
+            try {
+                ok = builtin.init(appContext);
+            } catch (Throwable t) {
+                ok = false;
+                builtinErr = String.valueOf(t);
+            }
             builtinReady = ok;
             if (ok) {
                 engineName = "内置离线语音";
                 zhAvailable = true;
                 ready = true;
                 Log.i(TAG, "builtin tts ready");
+            } else if (builtinErr.isEmpty()) {
+                builtinErr = builtin.getLastError();
             }
             publishState();
         }, "qingyue-tts-init").start();
 
         // 系统引擎照常初始化，作为内置引擎的兜底
         initEngine(null);
+    }
+
+    /** 页面加载完成后由 Activity 调用：重推一次状态（解决推送早于页面注册的时序问题） */
+    public void notifyPageReady() {
+        main.post(this::publishState);
+    }
+
+    /** JS 可同步拉取的完整诊断状态（解决一切时序竞争） */
+    @JavascriptInterface
+    public String getDiag() {
+        try {
+            JSONObject o = new JSONObject();
+            o.put("ver", APP_VER);
+            o.put("builtinReady", builtinReady);
+            o.put("builtinErr", builtinErr == null ? "" : builtinErr);
+            o.put("engine", builtinReady ? "内置离线语音（小燕）" : safeStr(engineName));
+            o.put("zh", builtinReady || zhAvailable);
+            o.put("voices", builtinReady ? 1 : systemVoiceCount());
+            o.put("ready", builtinReady || ready);
+            return o.toString();
+        } catch (Exception e) {
+            return "{\"ver\":\"" + APP_VER + "\",\"builtinReady\":false,\"builtinErr\":\"diag error\",\"engine\":\"\",\"zh\":false,\"voices\":0,\"ready\":false}";
+        }
+    }
+
+    private String safeStr(String s) { return s == null ? "" : s; }
+
+    private int systemVoiceCount() {
+        try {
+            Set<Voice> vs = tts != null ? tts.getVoices() : null;
+            return vs == null ? 0 : vs.size();
+        } catch (Exception ignore) { return 0; }
     }
 
     /* ---------------- 引擎初始化与选择 ---------------- */
@@ -226,7 +268,10 @@ public class NativeTTS {
     @JavascriptInterface
     public void testSpeak() {
         if (builtinReady && builtin.isReady()) {
-            builtin.speak("你好，这是轻阅读书的内置语音试听，现在可以正常朗读了。", rate, ok -> fireTest(ok));
+            builtin.speak("你好，这是轻阅读书的内置语音试听，现在可以正常朗读了。", rate, ok -> {
+                if (!ok) Log.w(TAG, "builtin test failed: " + builtin.getLastError());
+                fireTest(ok);
+            });
             return;
         }
         main.post(() -> {
@@ -346,30 +391,36 @@ public class NativeTTS {
         });
     }
 
-    /** 朗读一句；id 为递增序号，用于与网页侧的播放会话校验 */
+    /** 朗读一句；id 为递增序号，用于与网页侧的播放会话校验。内置引擎失败时自动回退系统引擎 */
     @JavascriptInterface
     public void speak(final String text, final String id) {
         if (builtinReady && builtin.isReady()) {
-            builtin.speak(text, rate, ok -> fire(ok ? "done" : "error", id));
+            builtin.speak(text, rate, ok -> {
+                if (ok) { fire("done", id); return; }
+                Log.w(TAG, "builtin speak failed, fallback to system tts");
+                systemSpeak(text, id);
+            });
             return;
         }
-        main.post(() -> {
-            if (tts == null || !ready || text == null || text.isEmpty()) {
-                fire("error", id);
-                return;
-            }
-            try {
-                tts.setSpeechRate(rate);
-                tts.setPitch(pitch);
-                applyVoice();
-                Bundle params = new Bundle();
-                params.putString(TextToSpeech.Engine.KEY_PARAM_UTTERANCE_ID, id);
-                int res = tts.speak(text, TextToSpeech.QUEUE_ADD, params, id);
-                if (res != TextToSpeech.SUCCESS) fire("error", id);
-            } catch (Exception e) {
-                fire("error", id);
-            }
-        });
+        main.post(() -> systemSpeak(text, id));
+    }
+
+    private void systemSpeak(final String text, final String id) {
+        if (tts == null || !ready || text == null || text.isEmpty()) {
+            fire("error", id);
+            return;
+        }
+        try {
+            tts.setSpeechRate(rate);
+            tts.setPitch(pitch);
+            applyVoice();
+            Bundle params = new Bundle();
+            params.putString(TextToSpeech.Engine.KEY_PARAM_UTTERANCE_ID, id);
+            int res = tts.speak(text, TextToSpeech.QUEUE_ADD, params, id);
+            if (res != TextToSpeech.SUCCESS) fire("error", id);
+        } catch (Exception e) {
+            fire("error", id);
+        }
     }
 
     @JavascriptInterface
@@ -534,7 +585,7 @@ public class NativeTTS {
         });
     }
 
-    /** 装好语音引擎后重新初始化检测 */
+    /** 装好语音引擎后重新初始化检测；内置引擎失败时也一并重试 */
     @JavascriptInterface
     public void reinit() {
         main.post(() -> {
@@ -544,6 +595,22 @@ public class NativeTTS {
             zhAvailable = false;
             initEngine(null);
         });
+        new Thread(() -> {
+            if (!builtinReady) {
+                try { builtin.shutdown(); } catch (Exception ignore) {}
+                boolean ok = builtin.init(appContext);
+                builtinReady = ok;
+                if (ok) {
+                    builtinErr = "";
+                    engineName = "内置离线语音";
+                    zhAvailable = true;
+                    ready = true;
+                } else {
+                    builtinErr = builtin.getLastError();
+                }
+                publishState();
+            }
+        }, "qingyue-tts-reinit").start();
     }
 
     /** 跳转系统「文字转语音」设置页（安装/切换语音引擎） */
