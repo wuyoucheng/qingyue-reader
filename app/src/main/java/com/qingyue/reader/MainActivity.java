@@ -271,6 +271,12 @@ public class MainActivity extends ComponentActivity {
                 String url = request.getUrl().toString();
                 return !url.startsWith("https://appassets.androidplatform.net/");
             }
+
+            @Override
+            public void onPageFinished(WebView view, String url) {
+                // 页面 JS 已就绪：重推一次 TTS 引擎状态，避免早前推送丢失
+                if (nativeTTS != null) nativeTTS.notifyPageReady();
+            }
         });
 
         webView.setWebChromeClient(new WebChromeClient() {
