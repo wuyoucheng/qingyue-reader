@@ -27,6 +27,7 @@ public class OfflineTtsEngine {
     private volatile AudioTrack track;
     private Thread worker;
     private int sampleRate = 22050;
+    private volatile String lastError = "";   // 最近一次初始化/合成失败的错误描述
 
     /** 加载模型（首次约 1~2 秒），成功返回 true */
     public boolean init(Context ctx) {
@@ -39,7 +40,8 @@ public class OfflineTtsEngine {
                     "",                                      // dictDir
                     0.667f, 0.8f, 1.0f);
             OfflineTtsModelConfig mc = new OfflineTtsModelConfig(vits, null, null, 2, false, "cpu");
-            OfflineTtsConfig cfg = new OfflineTtsConfig(mc, "", "", 1, 1.0f);
+            // 参数：modelConfig, ruleFsts, ruleFars, maxSentenceLength(必须>1，用默认值量级), silenceScale
+            OfflineTtsConfig cfg = new OfflineTtsConfig(mc, "", "", 500, 1.0f);
             long t0 = System.currentTimeMillis();
             tts = new OfflineTts(ctx.getAssets(), cfg);
             sampleRate = tts.sampleRate();
@@ -47,12 +49,15 @@ public class OfflineTtsEngine {
             return true;
         } catch (Throwable t) {
             Log.w(TAG, "init: " + t);
+            lastError = String.valueOf(t);
             tts = null;
             return false;
         }
     }
 
     public boolean isReady() { return tts != null; }
+
+    public String getLastError() { return lastError == null ? "" : lastError; }
 
     public int getSampleRate() { return sampleRate; }
 
@@ -92,6 +97,7 @@ public class OfflineTtsEngine {
                 ok = playing;
             } catch (Throwable e) {
                 Log.w(TAG, "speak: " + e);
+                lastError = String.valueOf(e);
                 ok = false;
             } finally {
                 try { if (holder[0] != null) { holder[0].stop(); holder[0].release(); } } catch (Exception ignore) {}
