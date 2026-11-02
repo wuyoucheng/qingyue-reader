@@ -28,10 +28,6 @@ android {
         targetCompatibility JavaVersion.VERSION_17
     }
 
-    packagingOptions {
-        exclude 'META-INF/*.kotlin_module'
-    }
-
     lint {
         abortOnError false
         checkReleaseBuilds false
@@ -41,4 +37,13 @@ android {
 dependencies {
     implementation 'androidx.activity:activity:1.8.0'
     implementation 'androidx.webkit:webkit:1.8.0'
+}
+
+// 统一 kotlin-stdlib 版本，避免 jdk7/jdk8 旧包重复类导致构建失败
+configurations.all {
+    resolutionStrategy {
+        force 'org.jetbrains.kotlin:kotlin-stdlib:1.8.22'
+        force 'org.jetbrains.kotlin:kotlin-stdlib-jdk7:1.8.22'
+        force 'org.jetbrains.kotlin:kotlin-stdlib-jdk8:1.8.22'
+    }
 }
