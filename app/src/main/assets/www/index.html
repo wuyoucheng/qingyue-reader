@@ -1,0 +1,300 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no,viewport-fit=cover">
+<meta name="theme-color" content="#f7f3e8">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="default">
+<meta name="apple-mobile-web-app-title" content="轻阅">
+<title>轻阅 · 本地小说阅读器</title>
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="apple-touch-icon" href="icons/icon-192.png">
+<link rel="icon" href="icons/icon-192.png">
+<link rel="stylesheet" href="css/app.css">
+</head>
+<body>
+
+<svg style="display:none" aria-hidden="true">
+  <symbol id="i-plus" viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></symbol>
+  <symbol id="i-book" viewBox="0 0 24 24"><path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"/><path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z"/></symbol>
+  <symbol id="i-list" viewBox="0 0 24 24"><path d="M8 6h13M8 12h13M8 18h13M3 6h.01M3 12h.01M3 18h.01"/></symbol>
+  <symbol id="i-sliders" viewBox="0 0 24 24"><path d="M4 21v-7M4 10V3M12 21v-9M12 8V3M20 21v-5M20 12V3M1 14h6M9 8h6M17 16h6"/></symbol>
+  <symbol id="i-moon" viewBox="0 0 24 24"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></symbol>
+  <symbol id="i-headphone" viewBox="0 0 24 24"><path d="M3 18v-6a9 9 0 0 1 18 0v6"/><path d="M21 19a2 2 0 0 1-2 2h-1a2 2 0 0 1-2-2v-3a2 2 0 0 1 2-2h3zM3 19a2 2 0 0 0 2 2h1a2 2 0 0 0 2-2v-3a2 2 0 0 0-2-2H3z"/></symbol>
+  <symbol id="i-back" viewBox="0 0 24 24"><path d="M15 18l-6-6 6-6"/></symbol>
+  <symbol id="i-more" viewBox="0 0 24 24"><circle cx="12" cy="12" r="1"/><circle cx="19" cy="12" r="1"/><circle cx="5" cy="12" r="1"/></symbol>
+  <symbol id="i-x" viewBox="0 0 24 24"><path d="M18 6L6 18M6 6l12 12"/></symbol>
+  <symbol id="i-play" viewBox="0 0 24 24"><path d="M5 3l14 9-14 9V3z"/></symbol>
+  <symbol id="i-pause" viewBox="0 0 24 24"><path d="M6 4h4v16H6zM14 4h4v16h-4z"/></symbol>
+  <symbol id="i-prev" viewBox="0 0 24 24"><path d="M19 20L9 12l10-8v16z"/><path d="M5 19V5"/></symbol>
+  <symbol id="i-next" viewBox="0 0 24 24"><path d="M5 4l10 8-10 8V4z"/><path d="M19 5v14"/></symbol>
+  <symbol id="i-stop" viewBox="0 0 24 24"><rect x="6" y="6" width="12" height="12" rx="2"/></symbol>
+  <symbol id="i-search" viewBox="0 0 24 24"><circle cx="11" cy="11" r="8"/><path d="M21 21l-4.35-4.35"/></symbol>
+  <symbol id="i-trash" viewBox="0 0 24 24"><path d="M3 6h18M8 6V4h8v2M19 6l-1 14H6L5 6"/></symbol>
+  <symbol id="i-clock" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></symbol>
+  <symbol id="i-check" viewBox="0 0 24 24"><path d="M20 6L9 17l-5-5"/></symbol>
+  <symbol id="i-refresh" viewBox="0 0 24 24"><path d="M23 4v6h-6M1 20v-6h6"/><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/></symbol>
+  <symbol id="i-info" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 16v-4M12 8h.01"/></symbol>
+</svg>
+
+<!-- ============ 书架页 ============ -->
+<section id="page-library" class="page active">
+  <header class="lib-header">
+    <div class="lib-title">
+      <h1>轻阅</h1>
+      <span class="lib-sub">本地小说阅读器</span>
+    </div>
+    <button class="icon-btn" id="btn-about" title="关于"><svg><use href="#i-info"/></svg></button>
+  </header>
+
+  <div class="lib-body">
+    <div class="import-dock">
+      <button class="import-btn" id="btn-import">
+        <svg class="ic"><use href="#i-plus"/></svg>
+        <span>导入本地小说</span>
+      </button>
+      <p class="import-tip">支持 TXT / EPUB，文件只存在你手机本地，不会上传</p>
+    </div>
+
+    <div class="lib-meta">
+      <span id="lib-count">0 本</span>
+      <span class="dot">·</span>
+      <button class="link-btn" id="btn-sort">按最近阅读</button>
+    </div>
+
+    <div id="shelf" class="shelf"></div>
+
+    <div id="empty-state" class="empty-state">
+      <svg class="empty-ic"><use href="#i-book"/></svg>
+      <p class="empty-t">书架空空如也</p>
+      <p class="empty-d">点击上方按钮导入 TXT 或 EPUB 小说<br>阅读进度与听书设置会自动保存</p>
+    </div>
+  </div>
+</section>
+
+<!-- ============ 阅读页 ============ -->
+<section id="page-reader" class="page">
+  <header class="rd-top" id="rd-top">
+    <button class="icon-btn" id="btn-back" title="返回书架"><svg><use href="#i-back"/></svg></button>
+    <div class="rd-title-wrap">
+      <div class="rd-book" id="rd-book-name">—</div>
+      <div class="rd-chap" id="rd-chap-name">—</div>
+    </div>
+    <button class="icon-btn" id="btn-tts-open" title="听书"><svg><use href="#i-headphone"/></svg></button>
+  </header>
+
+  <div class="rd-scroll" id="rd-scroll">
+    <div class="rd-content" id="rd-content">
+      <h2 class="rd-chapter-title" id="rd-chapter-title"></h2>
+      <div class="rd-text" id="rd-text"></div>
+      <div class="rd-end" id="rd-end">
+        <div class="rd-end-info" id="rd-end-info"></div>
+        <div class="rd-end-btns">
+          <button class="ghost-btn" id="btn-prev-chap">上一章</button>
+          <button class="ghost-btn" id="btn-next-chap">下一章</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div class="rd-progress-mini"><div class="rd-progress-bar"><i id="rd-progress-fill"></i></div></div>
+
+  <footer class="rd-bottom" id="rd-bottom">
+    <button class="tool-btn" id="btn-catalog"><svg><use href="#i-list"/></svg><span>目录</span></button>
+    <button class="tool-btn" id="btn-theme"><svg><use href="#i-moon"/></svg><span>夜间</span></button>
+    <button class="tool-btn" id="btn-font"><svg><use href="#i-sliders"/></svg><span>排版</span></button>
+    <button class="tool-btn" id="btn-listen"><svg><use href="#i-headphone"/></svg><span>听书</span></button>
+  </footer>
+
+  <div class="toast-lite" id="rd-toast"></div>
+</section>
+
+<!-- ============ 目录面板 ============ -->
+<div class="sheet" id="sheet-catalog">
+  <div class="sheet-mask" data-close></div>
+  <div class="sheet-panel sheet-right">
+    <div class="sheet-head">
+      <h3>目录</h3>
+      <div class="sheet-head-right">
+        <span class="chip" id="catalog-count"></span>
+        <button class="icon-btn" data-close><svg><use href="#i-x"/></svg></button>
+      </div>
+    </div>
+    <div class="catalog-search">
+      <svg class="ic"><use href="#i-search"/></svg>
+      <input type="search" id="catalog-search" placeholder="搜索章节标题" inputmode="search">
+    </div>
+    <div class="catalog-list" id="catalog-list"></div>
+  </div>
+</div>
+
+<!-- ============ 设置面板 ============ -->
+<div class="sheet" id="sheet-settings">
+  <div class="sheet-mask" data-close></div>
+  <div class="sheet-panel sheet-bottom">
+    <div class="sheet-head">
+      <h3>阅读设置</h3>
+      <button class="icon-btn" data-close><svg><use href="#i-x"/></svg></button>
+    </div>
+    <div class="sheet-body">
+      <div class="set-group">
+        <label class="set-label">字号 <b id="val-font">18</b> px</label>
+        <div class="seg" id="seg-font">
+          <button data-v="-2">A-</button><button data-v="-1">小</button><button data-v="0">标准</button><button data-v="1">大</button><button data-v="2">A+</button>
+        </div>
+        <input type="range" id="rng-font" min="14" max="30" step="1" value="18">
+      </div>
+      <div class="set-group">
+        <label class="set-label">行距 <b id="val-line">1.8</b></label>
+        <input type="range" id="rng-line" min="1.3" max="2.4" step="0.1" value="1.8">
+      </div>
+      <div class="set-group">
+        <label class="set-label">页边距 <b id="val-pad">20</b> px</label>
+        <input type="range" id="rng-pad" min="12" max="40" step="2" value="20">
+      </div>
+      <div class="set-group">
+        <label class="set-label">背景</label>
+        <div class="theme-picker" id="theme-picker">
+          <button data-theme="paper" class="sw-paper"><i></i><span>米黄</span></button>
+          <button data-theme="white" class="sw-white"><i></i><span>纯白</span></button>
+          <button data-theme="green" class="sw-green"><i></i><span>护眼</span></button>
+          <button data-theme="gray" class="sw-gray"><i></i><span>淡灰</span></button>
+          <button data-theme="dark" class="sw-dark"><i></i><span>夜间</span></button>
+        </div>
+      </div>
+      <div class="set-group">
+        <label class="set-label">字体</label>
+        <div class="seg" id="seg-family">
+          <button data-v="sans">黑体</button><button data-v="serif">宋体</button><button data-v="kai">楷体</button>
+        </div>
+      </div>
+      <div class="set-group">
+        <label class="set-label">翻页方式</label>
+        <div class="seg" id="seg-scroll">
+          <button data-v="scroll">滚动</button><button data-v="page">翻页</button>
+        </div>
+      </div>
+      <div class="set-row">
+        <div><div class="set-t">滚到底自动进入下一章</div><div class="set-d">关闭时需手动点击「下一章」</div></div>
+        <label class="switch"><input type="checkbox" id="sw-auto-next"><i></i></label>
+      </div>
+      <div class="set-row">
+        <div><div class="set-t">听书时屏幕常亮</div><div class="set-d">息屏可能导致朗读中断</div></div>
+        <label class="switch"><input type="checkbox" id="sw-wake"><i></i></label>
+      </div>
+      <div class="set-row">
+        <div><div class="set-t">听书时自动滚动跟随</div><div class="set-d">朗读到哪，页面滚到哪</div></div>
+        <label class="switch"><input type="checkbox" id="sw-follow"><i></i></label>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ============ 听书面板 ============ -->
+<div class="sheet" id="sheet-tts">
+  <div class="sheet-mask" data-close></div>
+  <div class="sheet-panel sheet-bottom tts-panel">
+    <div class="sheet-head">
+      <h3>听书</h3>
+      <button class="icon-btn" data-close><svg><use href="#i-x"/></svg></button>
+    </div>
+    <div class="sheet-body">
+      <div class="tts-now" id="tts-now">—</div>
+      <div class="tts-text" id="tts-text">准备就绪</div>
+
+      <div class="tts-controls">
+        <button class="tts-btn" id="tts-prev" title="上一句"><svg><use href="#i-prev"/></svg></button>
+        <button class="tts-btn tts-main" id="tts-play" title="播放/暂停"><svg id="tts-play-ic"><use href="#i-play"/></svg></button>
+        <button class="tts-btn" id="tts-next" title="下一句"><svg><use href="#i-next"/></svg></button>
+        <button class="tts-btn" id="tts-stop" title="停止"><svg><use href="#i-stop"/></svg></button>
+      </div>
+
+      <div class="set-group">
+        <label class="set-label">朗读音色</label>
+        <select id="tts-voice" class="select"></select>
+        <div class="set-d" id="tts-voice-tip">音色由手机系统语音引擎提供，可在系统设置中安装中文语音包</div>
+      </div>
+      <div class="set-group">
+        <label class="set-label">语速 <b id="val-rate">1.0</b>×</label>
+        <input type="range" id="rng-rate" min="0.5" max="2" step="0.1" value="1">
+      </div>
+      <div class="set-group">
+        <label class="set-label">音调 <b id="val-pitch">1.0</b></label>
+        <input type="range" id="rng-pitch" min="0.5" max="1.8" step="0.1" value="1">
+      </div>
+      <div class="set-group">
+        <label class="set-label">定时关闭</label>
+        <div class="seg" id="seg-timer">
+          <button data-v="0">不限</button><button data-v="15">15分</button><button data-v="30">30分</button><button data-v="60">60分</button><button data-v="90">90分</button>
+        </div>
+        <div class="set-d" id="tts-timer-left"></div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ============ 书籍详情面板 ============ -->
+<div class="sheet" id="sheet-book">
+  <div class="sheet-mask" data-close></div>
+  <div class="sheet-panel sheet-bottom">
+    <div class="sheet-head">
+      <h3 id="bk-title">书籍信息</h3>
+      <button class="icon-btn" data-close><svg><use href="#i-x"/></svg></button>
+    </div>
+    <div class="sheet-body">
+      <div class="bk-info" id="bk-info"></div>
+      <div class="set-group" id="bk-encode-group">
+        <label class="set-label">文本编码</label>
+        <select id="bk-encode" class="select">
+          <option value="auto">自动识别</option>
+          <option value="utf-8">UTF-8</option>
+          <option value="gb18030">GBK / GB18030</option>
+          <option value="big5">BIG5 繁体</option>
+          <option value="utf-16le">UTF-16LE</option>
+        </select>
+        <div class="set-d">乱码时切换编码后重新分章</div>
+      </div>
+      <div class="bk-actions">
+        <button class="ghost-btn wide" id="bk-restart"><svg class="ic"><use href="#i-refresh"/></svg> 从头开始阅读</button>
+        <button class="ghost-btn wide" id="bk-reparse"><svg class="ic"><use href="#i-refresh"/></svg> 重新分章</button>
+        <button class="ghost-btn wide danger" id="bk-delete"><svg class="ic"><use href="#i-trash"/></svg> 从书架删除</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ============ 关于面板 ============ -->
+<div class="sheet" id="sheet-about">
+  <div class="sheet-mask" data-close></div>
+  <div class="sheet-panel sheet-bottom">
+    <div class="sheet-head">
+      <h3>关于轻阅</h3>
+      <button class="icon-btn" data-close><svg><use href="#i-x"/></svg></button>
+    </div>
+    <div class="sheet-body about-body">
+      <p><b>轻阅</b> 是一个纯本地的小说阅读器。所有书籍内容保存在你手机的浏览器存储中，不上传服务器、无需注册登录。</p>
+      <ul class="about-list">
+        <li><svg class="ic"><use href="#i-check"/></svg> TXT / EPUB 导入，自动分章节</li>
+        <li><svg class="ic"><use href="#i-check"/></svg> 自动记录上次阅读位置，秒回现场</li>
+        <li><svg class="ic"><use href="#i-check"/></svg> 系统语音朗读，支持定时关闭</li>
+        <li><svg class="ic"><use href="#i-check"/></svg> 添加到手机桌面后离线可用</li>
+      </ul>
+      <p class="about-tip"><b>装到桌面：</b>iPhone 用 Safari 打开后点「分享 → 添加到主屏幕」；安卓 Chrome 点右上角菜单「添加到主屏幕 / 安装应用」。</p>
+      <p class="about-tip"><b>听书没声音？</b>需要手机已安装中文语音引擎（安卓：设置 → 系统 → 语言和输入法 → 文字转语音，安装 Google 文字转语音的中文语音包）。</p>
+      <p class="about-tip" id="about-storage"></p>
+    </div>
+  </div>
+</div>
+
+<!-- 通用遮罩 / 提示 -->
+<div class="loading-mask" id="loading-mask"><div class="spinner"></div><div class="loading-text" id="loading-text">解析中…</div></div>
+<div class="toast" id="toast"></div>
+
+<input type="file" id="file-input" accept=".txt,.text,.epub,text/plain,application/epub+zip" multiple hidden>
+
+<script src="vendor/jszip.min.js"></script>
+<script type="module" src="js/app.js"></script>
+</body>
+</html>
