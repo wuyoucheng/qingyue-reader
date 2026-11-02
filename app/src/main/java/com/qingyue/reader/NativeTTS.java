@@ -3,6 +3,7 @@ package com.qingyue.reader;
 import android.app.Activity;
 import android.content.Context;
 import android.content.Intent;
+import android.net.Uri;
 import android.os.Build;
 import android.os.Bundle;
 import android.os.Handler;
@@ -50,10 +51,30 @@ public class NativeTTS {
     private String voiceName = null;
     private boolean engineProbing = false; // 防止重复探测
 
+    /* 内置离线引擎（sherpa-onnx + 小燕中文女声）：优先使用 */
+    private final OfflineTtsEngine builtin = new OfflineTtsEngine();
+    private volatile boolean builtinReady = false;
+    private static final String BUILTIN_NAME = "小燕 · 离线女声";
+
     public NativeTTS(Activity activity, WebView webView) {
         this.activity = activity;
         this.webView = webView;
         this.appContext = activity.getApplicationContext();
+
+        // 内置引擎在后台加载模型（不阻塞 UI），成功后接管朗读
+        new Thread(() -> {
+            boolean ok = builtin.init(appContext);
+            builtinReady = ok;
+            if (ok) {
+                engineName = "内置离线语音";
+                zhAvailable = true;
+                ready = true;
+                Log.i(TAG, "builtin tts ready");
+            }
+            publishState();
+        }, "qingyue-tts-init").start();
+
+        // 系统引擎照常初始化，作为内置引擎的兜底
         initEngine(null);
     }
 
@@ -164,15 +185,23 @@ public class NativeTTS {
 
     /** 把引擎状态推给网页：window.__ttsState(engine, zhAvailable, voiceCount, ready) */
     private void publishState() {
-        int n = 0;
-        try {
-            Set<Voice> vs = tts != null ? tts.getVoices() : null;
-            n = vs == null ? 0 : vs.size();
-        } catch (Exception ignore) {}
-        final String eng = engineName == null ? "" : engineName;
-        final boolean zh = zhAvailable;
-        final int cnt = n;
-        final boolean rdy = ready;
+        final String eng;
+        final boolean zh;
+        final int cnt;
+        final boolean rdy;
+        if (builtinReady) {
+            eng = "内置离线语音（小燕）"; zh = true; cnt = 1; rdy = true;
+        } else {
+            int n = 0;
+            try {
+                Set<Voice> vs = tts != null ? tts.getVoices() : null;
+                n = vs == null ? 0 : vs.size();
+            } catch (Exception ignore) {}
+            eng = engineName == null ? "" : engineName;
+            zh = zhAvailable;
+            cnt = n;
+            rdy = ready;
+        }
         main.post(() -> {
             if (webView == null) return;
             webView.evaluateJavascript(
@@ -196,6 +225,10 @@ public class NativeTTS {
     /** 试读一句，验证当前引擎是否真的能出声 */
     @JavascriptInterface
     public void testSpeak() {
+        if (builtinReady && builtin.isReady()) {
+            builtin.speak("你好，这是轻阅读书的内置语音试听，现在可以正常朗读了。", rate, ok -> fireTest(ok));
+            return;
+        }
         main.post(() -> {
             if (tts == null || !ready) { fireTest(false); return; }
             try {
@@ -211,11 +244,18 @@ public class NativeTTS {
         });
     }
 
-    /** 列出已安装的 TTS 引擎 JSON：[{name,label}] */
+    /** 列出已安装的 TTS 引擎 JSON：[{name,label}]；内置引擎可用时只返回它 */
     @JavascriptInterface
     public String getEngines() {
         try {
             JSONArray arr = new JSONArray();
+            if (builtinReady) {
+                JSONObject o = new JSONObject();
+                o.put("name", "builtin");
+                o.put("label", "内置离线语音（小燕）");
+                arr.put(o);
+                return arr.toString();
+            }
             if (tts != null) {
                 List<TextToSpeech.EngineInfo> list = tts.getEngines();
                 if (list != null) {
@@ -237,6 +277,10 @@ public class NativeTTS {
     @JavascriptInterface
     public void useEngine(final String name) {
         if (name == null || name.isEmpty()) return;
+        if ("builtin".equals(name)) {
+            main.post(this::publishState);   // 内置引擎始终可用，切回它即可
+            return;
+        }
         main.post(() -> {
             if (name.equals(engineName)) return;
             try { if (tts != null) { tts.stop(); tts.shutdown(); } } catch (Exception ignore) {}
@@ -305,6 +349,10 @@ public class NativeTTS {
     /** 朗读一句；id 为递增序号，用于与网页侧的播放会话校验 */
     @JavascriptInterface
     public void speak(final String text, final String id) {
+        if (builtinReady && builtin.isReady()) {
+            builtin.speak(text, rate, ok -> fire(ok ? "done" : "error", id));
+            return;
+        }
         main.post(() -> {
             if (tts == null || !ready || text == null || text.isEmpty()) {
                 fire("error", id);
@@ -326,6 +374,7 @@ public class NativeTTS {
 
     @JavascriptInterface
     public void stop() {
+        if (builtinReady && builtin.isReady()) { builtin.stop(); return; }
         main.post(() -> {
             try { if (tts != null) tts.stop(); } catch (Exception e) { /* ignore */ }
         });
@@ -375,6 +424,14 @@ public class NativeTTS {
     @JavascriptInterface
     public String getVoices() {
         try {
+            if (builtinReady && builtin.isReady()) {
+                JSONArray arr = new JSONArray();
+                JSONObject o = new JSONObject();
+                o.put("name", BUILTIN_NAME);
+                o.put("locale", "zh-CN");
+                arr.put(o);
+                return arr.toString();
+            }
             JSONArray arr = new JSONArray();
             if (tts != null && Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
                 Set<Voice> set = tts.getVoices();
@@ -414,7 +471,7 @@ public class NativeTTS {
     private void applyVoice() {
         try {
             if (tts == null || voiceName == null || voiceName.isEmpty()) return;
-            if ("系统默认音色".equals(voiceName)) return;   // 不设置，用引擎默认
+            if ("系统默认音色".equals(voiceName) || BUILTIN_NAME.equals(voiceName)) return;
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
                 Set<Voice> set = tts.getVoices();
                 if (set == null) return;
@@ -444,10 +501,54 @@ public class NativeTTS {
         });
     }
 
+    /** 已安装引擎数量（0 = 一个语音引擎都没有；内置引擎可用时视为 1） */
+    @JavascriptInterface
+    public int engineCount() {
+        if (builtinReady) return 1;
+        try {
+            List<TextToSpeech.EngineInfo> l = tts != null ? tts.getEngines() : null;
+            return l == null ? 0 : l.size();
+        } catch (Exception e) {
+            return 0;
+        }
+    }
+
+    /** 跳应用商店搜索语音引擎（手机无任何 TTS 引擎时的引导） */
+    @JavascriptInterface
+    public void openMarket() {
+        main.post(() -> {
+            Intent i = new Intent(Intent.ACTION_VIEW,
+                    Uri.parse("market://search?q=" + Uri.encode("讯飞语记")));
+            i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+            try {
+                activity.startActivity(i);
+                return;
+            } catch (Exception ignore) {}
+            try {
+                activity.startActivity(new Intent(Intent.ACTION_VIEW,
+                        Uri.parse("https://app.mi.com/search?keywords=" + Uri.encode("讯飞语记")))
+                        .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK));
+            } catch (Exception e) {
+                Log.w(TAG, "openMarket: " + e.getMessage());
+            }
+        });
+    }
+
+    /** 装好语音引擎后重新初始化检测 */
+    @JavascriptInterface
+    public void reinit() {
+        main.post(() -> {
+            try { if (tts != null) { tts.stop(); tts.shutdown(); } } catch (Exception ignore) {}
+            tts = null;
+            ready = false;
+            zhAvailable = false;
+            initEngine(null);
+        });
+    }
+
     /** 跳转系统「文字转语音」设置页（安装/切换语音引擎） */
     @JavascriptInterface
-    public void openTtsSettings() {
-        main.post(() -> {
+    public void openTtsSettings() {        main.post(() -> {
             Intent i;
             try {
                 i = new Intent("com.android.settings.TTS_SETTINGS");
@@ -472,6 +573,7 @@ public class NativeTTS {
     }
 
     public void shutdown() {
+        try { builtin.shutdown(); } catch (Exception ignore) {}
         try {
             if (tts != null) {
                 tts.stop();
