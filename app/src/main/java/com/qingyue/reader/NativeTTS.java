@@ -56,7 +56,7 @@ public class NativeTTS {
     private volatile boolean builtinReady = false;
     private volatile String builtinErr = "";   // 内置引擎初始化失败原因（诊断用）
     private static final String BUILTIN_NAME = "小燕 · 离线女声";
-    private static final String APP_VER = "v1.6";
+    private static final String APP_VER = "v1.8";
 
     public NativeTTS(Activity activity, WebView webView) {
         this.activity = activity;
