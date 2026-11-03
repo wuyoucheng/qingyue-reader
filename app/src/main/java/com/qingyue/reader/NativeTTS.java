@@ -56,7 +56,7 @@ public class NativeTTS {
     private volatile boolean builtinReady = false;
     private volatile String builtinErr = "";   // 内置引擎初始化失败原因（诊断用）
     private static final String BUILTIN_NAME = "小燕 · 离线女声";
-    private static final String APP_VER = "v1.18";
+    private static final String APP_VER = "v1.19";
 
     /* 在线音色：微软 Edge TTS（免费、无需 key；纯 Java 实现，不碰 native） */
     private EdgeTtsEngine edge;
@@ -98,6 +98,17 @@ public class NativeTTS {
      * 网页只在前台时接收进度回调用于高亮。 */
     private static volatile NativeTTS INSTANCE;
     private final List<String> queue = new ArrayList<>();
+
+    /** 已排队待播的后续章节（原生自主跨章用） */
+    private static class Seg {
+        final String title;
+        final List<String> s;
+        Seg(String t, List<String> s) { this.title = t == null ? "" : t; this.s = s; }
+    }
+    private final List<Seg> qPending = new ArrayList<>();
+    private volatile int qChapter = 0;           // 当前章节的全局序号（与书籍目录一致）
+    private volatile int qNeedWait = 0;          // 等待网页补章节的重试次数
+
     private volatile int qIndex = 0;
     private volatile boolean qPlaying = false;
     private volatile boolean qPaused = false;
@@ -441,7 +452,8 @@ public class NativeTTS {
     }
 
     private String esc(String s) {
-        return s == null ? "" : s.replace("\\", "\\\\").replace("'", "\\'");
+        return s == null ? "" : s.replace("\\", "\\\\").replace("'", "\\'")
+                .replace("\n", " ").replace("\r", " ").replace("\t", " ");
     }
 
     /** 试听结果回调 JS：window.__ttsTest(ok) */
@@ -734,7 +746,7 @@ public class NativeTTS {
         }
     }
 
-    /** 开始原生队列朗读。sentencesJson 为整章句子数组 */
+    /** 开始原生队列朗读。sentencesJson 为整章句子数组（单章模式，保留兼容） */
     @JavascriptInterface
     public void startQueue(final String sentencesJson, final int startIndex,
                            final String chapterTitle, final String bookTitle, final int timerMin) {
@@ -750,32 +762,132 @@ public class NativeTTS {
                 Log.w(TAG, "startQueue parse: " + t);
             }
             if (list.isEmpty()) { evalJs("window.__ttsQueueError&&window.__ttsQueueError('本章没有可朗读的内容')"); return; }
-
-            stopPlaybackInternal();          // 先静音旧的（不重置队列状态）
-            queue.clear();
-            queue.addAll(list);
-            qTitle = chapterTitle == null ? "" : chapterTitle;
-            qBook = bookTitle == null ? "" : bookTitle;
-            qIndex = Math.max(0, Math.min(startIndex, queue.size() - 1));
-            qPlaying = true;
-            qPaused = false;
-            qErrStreak = 0;
-            qLastNotified = -1;
-            qTimerEndAt = timerMin > 0 ? System.currentTimeMillis() + timerMin * 60000L : 0;
-
-            PlaybackService.start(appContext);
-            main.removeCallbacks(qTimerTick);
-            if (qTimerEndAt > 0) main.postDelayed(qTimerTick, 1000);
-
-            Log.i(TAG, "queue start: " + queue.size() + " 句, from " + qIndex);
-            notifyProgress(true);
-            playAt(qIndex);
+            List<Seg> one = new ArrayList<>();
+            one.add(new Seg(chapterTitle, list));
+            startSegs(one, startIndex, bookTitle, 0, timerMin);
         });
     }
 
+    /**
+     * 多章朗读：json 形如 [{"t":"第一章","s":["句1","句2"]}, ...]，第 0 段为起始章。
+     * 原生按段推进，一段念完自动进入下一段；段全部念完才回网页要新章节。
+     * 这样锁屏/后台（网页被冻结）也能连续跨章。
+     */
+    @JavascriptInterface
+    public void startChapters(final String json, final int startIndex, final String bookTitle,
+                              final int baseChapter, final int timerMin) {
+        main.post(() -> {
+            List<Seg> segs = parseSegs(json);
+            if (segs.isEmpty() || segs.get(0).s.isEmpty()) {
+                evalJs("window.__ttsQueueError&&window.__ttsQueueError('本章没有可朗读的内容')");
+                return;
+            }
+            startSegs(segs, startIndex, bookTitle, baseChapter, timerMin);
+        });
+    }
+
+    /** 网页补充后续章节（前台时提前/prefetch 或原生索要时调用） */
+    @JavascriptInterface
+    public void appendChapters(final String json) {
+        main.post(() -> {
+            List<Seg> segs = parseSegs(json);
+            if (segs.isEmpty()) return;
+            qPending.addAll(segs);
+            qNeedWait = 0;
+            Log.i(TAG, "appendChapters +" + segs.size() + ", pending=" + qPending.size());
+            if (qPlaying && !qPaused && qIndex + 1 >= queue.size()) {
+                main.removeCallbacks(qMoreWait);   // 正在等章节，立刻续上
+                advanceChapter();
+            }
+        });
+    }
+
+    private List<Seg> parseSegs(String json) {
+        List<Seg> out = new ArrayList<>();
+        try {
+            JSONArray arr = new JSONArray(json == null ? "[]" : json);
+            for (int i = 0; i < arr.length(); i++) {
+                JSONObject o = arr.optJSONObject(i);
+                if (o == null) continue;
+                JSONArray ss = o.optJSONArray("s");
+                List<String> list = new ArrayList<>();
+                if (ss != null) {
+                    for (int j = 0; j < ss.length(); j++) {
+                        String s = ss.optString(j, "");
+                        list.add(s == null ? "" : s);
+                    }
+                }
+                if (!list.isEmpty()) out.add(new Seg(o.optString("t", ""), list));
+            }
+        } catch (Throwable t) {
+            Log.w(TAG, "parseSegs: " + t);
+        }
+        return out;
+    }
+
+    private void startSegs(List<Seg> segs, int startIndex, String bookTitle, int baseChapter, int timerMin) {
+        stopPlaybackInternal();          // 先静音旧的（不重置队列状态）
+        qPending.clear();
+        if (segs.size() > 1) qPending.addAll(segs.subList(1, segs.size()));
+        queue.clear();
+        queue.addAll(segs.get(0).s);
+        qTitle = segs.get(0).title;
+        qChapter = Math.max(0, baseChapter);
+        qBook = bookTitle == null ? "" : bookTitle;
+        qIndex = Math.max(0, Math.min(startIndex, queue.size() - 1));
+        qPlaying = true;
+        qPaused = false;
+        qErrStreak = 0;
+        qLastNotified = -1;
+        qNeedWait = 0;
+        qTimerEndAt = timerMin > 0 ? System.currentTimeMillis() + timerMin * 60000L : 0;
+
+        PlaybackService.start(appContext);
+        main.removeCallbacks(qTimerTick);
+        if (qTimerEndAt > 0) main.postDelayed(qTimerTick, 1000);
+
+        Log.i(TAG, "queue start: ch" + qChapter + " " + queue.size() + " 句, from " + qIndex
+                + ", 预排 " + qPending.size() + " 章");
+        notifyProgress(true);
+        playAt(qIndex);
+    }
+
+    /** 当前章念完：有预排章节就切过去，没有就回网页索要 */
+    private void advanceChapter() {
+        if (!qPlaying || qPaused) return;
+        if (qPending.isEmpty()) {
+            qNeedWait++;
+            if (qNeedWait > 2 || qChapter + 1 >= 9999) { finishQueue(); return; }
+            final int from = qChapter + 1;
+            evalJs("window.__ttsNeedChapters&&window.__ttsNeedChapters(" + from + ",8)");
+            main.removeCallbacks(qMoreWait);
+            main.postDelayed(qMoreWait, 1500);
+            return;
+        }
+        Seg seg = qPending.remove(0);
+        queue.clear();
+        queue.addAll(seg.s);
+        qTitle = seg.title;
+        qChapter++;
+        qIndex = 0;
+        qErrStreak = 0;
+        qLastNotified = -1;
+        Log.i(TAG, "-> ch" + qChapter + " " + qTitle + " (" + queue.size() + " 句)");
+        notifyProgress(true);
+        playAt(0);
+    }
+
+    private final Runnable qMoreWait = new Runnable() {
+        @Override public void run() {
+            if (!qPlaying || qPaused) return;
+            if (!qPending.isEmpty()) { advanceChapter(); return; }
+            finishQueue();          // 网页在后台补不上新章节，视为读完
+        }
+    };
+
     private void playAt(final int i) {
         if (!qPlaying || qPaused) return;
-        if (i >= queue.size()) { finishQueue(); return; }
+        if (i >= queue.size()) { advanceChapter(); return; }
 
         final int token = ++qToken;
         final String text = queue.get(i);
@@ -810,6 +922,8 @@ public class NativeTTS {
     private void finishQueue() {
         qPlaying = false;
         qPaused = false;
+        qPending.clear();
+        main.removeCallbacks(qMoreWait);
         main.removeCallbacks(qTimerTick);
         qTimerEndAt = 0;
         PlaybackService.stop(appContext);
@@ -838,7 +952,7 @@ public class NativeTTS {
             if (webView == null) return;
             try {
                 webView.evaluateJavascript("window.__ttsQueueProgress&&window.__ttsQueueProgress("
-                        + idx + "," + total + "," + playing + ")", null);
+                        + idx + "," + total + "," + playing + "," + qChapter + ",'" + esc(qTitle) + "')", null);
             } catch (Throwable ignore) { }
         });
     }
@@ -881,6 +995,9 @@ public class NativeTTS {
             qToken++;
             qErrStreak = 0;
             qTimerEndAt = 0;
+            qPending.clear();
+            qNeedWait = 0;
+            main.removeCallbacks(qMoreWait);
             main.removeCallbacks(qTimerTick);
             stopPlaybackInternal();
             notifyProgress(true);
@@ -946,7 +1063,7 @@ public class NativeTTS {
         });
     }
 
-    /** 队列状态 JSON：{playing,paused,index,total,timerLeft} */
+    /** 队列状态 JSON：{playing,paused,index,total,chapter,title,timerLeft} */
     @JavascriptInterface
     public String queueState() {
         try {
@@ -955,6 +1072,9 @@ public class NativeTTS {
             o.put("paused", qPaused);
             o.put("index", qIndex);
             o.put("total", queue.size());
+            o.put("chapter", qChapter);
+            o.put("title", qTitle);
+            o.put("book", qBook);
             long left = qTimerEndAt > 0 ? Math.max(0, (qTimerEndAt - System.currentTimeMillis()) / 1000) : 0;
             o.put("timerLeft", left);
             return o.toString();

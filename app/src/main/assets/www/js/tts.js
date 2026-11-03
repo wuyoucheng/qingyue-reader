@@ -25,6 +25,7 @@ export class Speaker {
     this.sentences = [];
     this.index = 0;
     this.total = 0;
+    this.chapter = -1;      // 原生当前朗读的章节序号（-1 = 未知）
     this.token = 0;
     this.wakeLock = null;
     this.timerMin = 0;
@@ -33,7 +34,9 @@ export class Speaker {
 
     this.hooks = {
       getSentences: () => [],          // () => string[]
-      getMeta: () => ({ book: '', chapter: '' }), // 用于通知栏显示
+      getMeta: () => ({ book: '', chapter: '', chapterIndex: 0 }), // 用于通知栏显示
+      collectChapters: async () => '[]', // (fromChapter, count) => JSON 多章句子
+      onRemoteChapter: () => {},        // (chapterIndex, title) 原生读到新章时通知网页
       highlight: () => {},             // (index) => void
       onChapterEnd: async () => false, // 返回 true 表示已切到下一章并可继续
       onState: () => {},
@@ -42,8 +45,11 @@ export class Speaker {
 
     if (this.native) {
       // 原生队列回调
-      window.__ttsQueueProgress = (i, total, playing) => this.onQueueProgress(i, total, playing);
+      window.__ttsQueueProgress = (i, total, playing, chapter, title) =>
+        this.onQueueProgress(i, total, playing, chapter, title);
       window.__ttsQueueEnd = () => this.onQueueEnd();
+      // 原生念完已交付的章节，索要后续章节
+      window.__ttsNeedChapters = (from, count) => this.provideChapters(from, count);
       window.__ttsQueueError = msg => {
         this.playing = false;
         this.paused = false;
@@ -72,6 +78,11 @@ export class Speaker {
         this.hooks.onError('定时关闭时间已到，朗读已停止');
       };
       window.__ttsEvent = (type, id) => this.onNativeEvent(type, id);
+
+      // 回到前台：后台期间进度回调可能被丢弃，这里与原生对齐一次
+      document.addEventListener('visibilitychange', () => {
+        if (!document.hidden) setTimeout(() => this.syncFromNative(), 120);
+      });
     }
 
     this.loadVoices();
@@ -82,13 +93,46 @@ export class Speaker {
 
   /* ---------------- 原生队列回调 ---------------- */
 
-  onQueueProgress(i, total, playing) {
+  onQueueProgress(i, total, playing, chapter, title) {
     if (typeof i === 'number') this.index = i;
     if (typeof total === 'number' && total > 0) this.total = total;
     if (playing === false && this.playing && !this.paused) this.paused = true;
     if (playing === true && !this.playing) this.playing = true;
+    if (playing === true && this.paused) this.paused = false;
+    if (typeof chapter === 'number' && chapter >= 0 && chapter !== this.chapter) {
+      this.chapter = chapter;
+      try { this.hooks.onRemoteChapter(chapter, title || ''); } catch (e) { /* ignore */ }
+    }
     this.hooks.highlight(this.index);
     this.emit();
+  }
+
+  /** 原生索要后续章节：读库拼 JSON 回填 */
+  async provideChapters(from, count) {
+    if (!this.native) return;
+    try {
+      const json = await this.hooks.collectChapters(from, count || 8);
+      if (json && json !== '[]') this.native.appendChapters(json);
+    } catch (e) { /* ignore */ }
+  }
+
+  /** 回到前台时与原生状态对齐（后台期间网页被冻结，进度回调可能丢失） */
+  syncFromNative() {
+    if (!this.queueMode || !this.native) return;
+    try {
+      const s = JSON.parse(this.native.queueState() || '{}');
+      if (!s || typeof s.playing !== 'boolean') return;
+      if (s.chapter >= 0 && s.chapter !== this.chapter) {
+        this.chapter = s.chapter;
+        try { this.hooks.onRemoteChapter(s.chapter, s.title || ''); } catch (e) {}
+      }
+      this.index = s.index || 0;
+      this.total = s.total || 0;
+      this.playing = !!s.playing;
+      this.paused = !!s.paused;
+      this.hooks.highlight(this.index);
+      this.emit();
+    } catch (e) { /* ignore */ }
   }
 
   async onQueueEnd() {
@@ -177,24 +221,46 @@ export class Speaker {
     this.setTimer(opt.timerMin || 0);
 
     if (this.queueMode) {
-      this.startNativeQueue(this.index);
+      await this.startNativeQueue(this.index);
       return;
     }
     this.speakAt(this.index);
   }
 
-  /** 把整章句子交给原生，由原生自己推进（后台/锁屏也能继续） */
-  startNativeQueue(from) {
+  /** 预取章节数：一次交付给原生，锁屏/后台可连续播很久 */
+  static get PREFETCH() { return 8; }
+
+  /**
+   * 把「当前章 + 后续若干章」一次性交给原生，由原生自己推进。
+   * 原生念完这批会回叫 __ttsNeedChapters 索取下一批；
+   * 网页若被冻结取不到，就在这批结束时自然停下（已尽量拉长）。
+   */
+  async startNativeQueue(from) {
     const o = this.opt || {};
     const meta = this.hooks.getMeta ? this.hooks.getMeta() : {};
+    const base = typeof meta.chapterIndex === 'number' ? meta.chapterIndex : 0;
     try {
       this.native.setRate(o.rate || 1);
       this.native.setPitch(o.pitch || 1);
       if (o.voiceURI) this.native.setVoice(o.voiceURI);
-      this.native.startQueue(
-        JSON.stringify(this.sentences), from,
-        meta.chapter || '', meta.book || '', o.timerMin || 0
-      );
+    } catch (e) { /* ignore */ }
+
+    let payload = '';
+    try {
+      payload = await this.hooks.collectChapters(base, Speaker.PREFETCH);
+    } catch (e) { payload = ''; }
+    if (!payload || payload === '[]') {
+      payload = JSON.stringify([{ t: meta.chapter || '', s: this.sentences }]);
+    }
+
+    try {
+      if (this.native.startChapters) {
+        this.native.startChapters(payload, from, meta.book || '', base, o.timerMin || 0);
+      } else {
+        this.native.startQueue(JSON.stringify(this.sentences), from,
+          meta.chapter || '', meta.book || '', o.timerMin || 0);
+      }
+      this.chapter = base;
       this.playing = true;
       this.paused = false;
       this.emit();
