@@ -56,7 +56,7 @@ public class NativeTTS {
     private volatile boolean builtinReady = false;
     private volatile String builtinErr = "";   // 内置引擎初始化失败原因（诊断用）
     private static final String BUILTIN_NAME = "小燕 · 离线女声";
-    private static final String APP_VER = "v1.21";
+    private static final String APP_VER = "v1.22";
 
     /* 在线音色：微软 Edge TTS（免费、无需 key；纯 Java 实现，不碰 native） */
     private EdgeTtsEngine edge;
@@ -566,6 +566,7 @@ public class NativeTTS {
             appContext.getSharedPreferences("qingyue_tts", Context.MODE_PRIVATE)
                     .edit().putString("voice_id", id).apply();
             try { if (edge != null) edge.stop(); } catch (Throwable ignore) {}
+            try { if (edge != null) edge.clearPrefetch(); } catch (Throwable ignore) {}   // 旧音色预取作废
             try { if (baidu != null) baidu.stop(); } catch (Throwable ignore) {}
             Log.i(TAG, "voice -> " + id);
             publishState();
@@ -918,6 +919,8 @@ public class NativeTTS {
         main.removeCallbacks(qWatchdog);
         main.postDelayed(qWatchdog, 20_000);
 
+        edge.clearPrefetch();            // 新的朗读会话，旧预取一律作废
+
         Log.i(TAG, "queue start: ch" + qChapter + " " + queue.size() + " 句, from " + qIndex
                 + ", 预排 " + qPending.size() + " 章");
         notifyProgress(true);
@@ -976,7 +979,8 @@ public class NativeTTS {
             if (!qPlaying || qPaused) return;
             if (ok) {
                 qErrStreak = 0;
-                main.postDelayed(() -> { if (token == qToken) playAt(i + 1); }, 40);
+                // 上一句快念完了，下一句（多半已预取）几乎可以立刻接上，不留空窗
+                main.postDelayed(() -> { if (token == qToken) playAt(i + 1); }, 10);
             } else {
                 qErrStreak++;
                 if (qErrStreak >= 4) {
@@ -987,6 +991,35 @@ public class NativeTTS {
                 main.postDelayed(() -> { if (token == qToken) playAt(i + 1); }, 80);
             }
         }, token);
+
+        // 当前句已经在念了，趁这段时间把后面两句合成好（命中缓存的句子不再重复请求）
+        prefetchAhead(i);
+    }
+
+    /**
+     * 预取后两句。逐句在线合成时，每句都要「建连接 → 合成 → 落盘」，
+     * 一段念完到下一段出声之间会空几百毫秒，听感就是明显停顿。
+     * 提前合成好后，下一句直接命中缓存开播，句间几乎无缝。
+     */
+    private void prefetchAhead(final int i) {
+        final String vid = voiceId == null ? DEFAULT_VOICE_ID : voiceId;
+        if (!vid.startsWith("edge:")) return;        // 百度/系统音色没有预取通道
+        final String v = voiceShortName(vid);
+        for (int k = i + 1; k <= i + 3; k++) {
+            String t;
+            if (k < queue.size()) {
+                t = queue.get(k);
+            } else if (!qPending.isEmpty()) {
+                // 跨到下一章的前几句，章末切换时就不会再等合成
+                int j = k - queue.size();
+                List<String> nx = qPending.get(0).s;
+                t = j < nx.size() ? nx.get(j) : null;
+            } else {
+                t = null;
+            }
+            if (t == null || t.trim().isEmpty()) continue;
+            edge.prefetch(t, v, rate);
+        }
     }
 
     private volatile int qToken = 0;
@@ -1075,6 +1108,7 @@ public class NativeTTS {
             main.removeCallbacks(qWatchdog);
             main.removeCallbacks(qTimerTick);
             stopPlaybackInternal();
+            edge.clearPrefetch();          // 停止朗读后预取内容作废
             notifyProgress(true);
             evalJs("window.__ttsQueueStopped&&window.__ttsQueueStopped()");
         });
