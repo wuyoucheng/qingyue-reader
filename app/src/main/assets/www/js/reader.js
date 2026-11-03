@@ -49,7 +49,10 @@ export const reader = {
       getMeta: () => ({
         book: this.book ? this.book.title : '',
         chapter: this.titles[this.chapterIndex] ? this.titles[this.chapterIndex].title : '',
+        chapterIndex: this.chapterIndex,
       }),
+      collectChapters: (from, count) => this.collectChapters(from, count),
+      onRemoteChapter: (i, t) => this.onRemoteChapter(i, t),
       highlight: i => this.highlight(i),
       onChapterEnd: async () => {
         if (this.chapterIndex + 1 < this.titles.length) {
@@ -105,6 +108,42 @@ export const reader = {
     const idx = Math.min(Math.max(0, p.chapterIndex || 0), this.titles.length - 1);
     await this.loadChapter(idx, { block: p.blockIndex || 0 });
     return true;
+  },
+
+  /**
+   * 收集 fromChapter 起的 count 章句子，交给原生连续播放（锁屏/后台跨章的核心）。
+   * 当前章直接用已切好的 this.sentences，其余章现读现切。
+   */
+  async collectChapters(fromChapter, count) {
+    if (!this.book) return '[]';
+    const out = [];
+    const end = Math.min(fromChapter + (count || 8), this.titles.length);
+    for (let i = fromChapter; i < end; i++) {
+      let sents = null;
+      if (i === this.chapterIndex && this.sentences.length) {
+        sents = this.sentences.slice();
+      } else {
+        const ch = await db.getChapter(this.book.id, i);
+        if (!ch) break;
+        sents = [];
+        String(ch.text || '').split(/\n+/).map(s => s.trim()).filter(Boolean)
+          .forEach(p => { for (const s of splitSentences(p)) sents.push(s); });
+      }
+      if (!sents.length) break;   // 遇到空章就停，避免章节序号错位
+      out.push({
+        t: (this.titles[i] && this.titles[i].title) || ('第 ' + (i + 1) + ' 章'),
+        s: sents,
+      });
+    }
+    return JSON.stringify(out);
+  },
+
+  /** 原生已读到别的章：网页跟随切换（后台期间冻结，回到前台时由 syncFromNative 补） */
+  onRemoteChapter(chapter) {
+    if (!this.book) return;
+    if (chapter === this.chapterIndex) return;
+    if (!(chapter >= 0 && chapter < this.titles.length)) return;
+    this.loadChapter(chapter, { toTop: true, auto: true, keepIndex: true });
   },
 
   async loadChapter(index, opt = {}) {
@@ -165,8 +204,8 @@ export const reader = {
     });
 
     if (this.speaker.playing) {
+      // 句子表更新为当前显示章；index 由原生进度回调驱动，这里不重置
       this.speaker.sentences = this.sentences;
-      this.speaker.index = 0;
     }
   },
 
