@@ -526,6 +526,33 @@ const app = {
       this.syncSettingsUI();
       if (v && reader.speaker.playing) this.toast(`${v} 分钟后自动停止朗读`);
     });
+
+    $('btn-battery').addEventListener('click', () => {
+      try {
+        if (window.AndroidTTS && window.AndroidTTS.requestIgnoreBattery) {
+          window.AndroidTTS.requestIgnoreBattery();
+          this.toast('请在系统弹窗里选择「允许」，把轻阅加入白名单');
+        } else {
+          this.toast('当前环境无需设置');
+        }
+      } catch (e) { this.toast('打开设置失败'); }
+      setTimeout(() => this.refreshBattery(), 1200);
+    });
+  },
+
+  /** 锁屏保活状态：未忽略电池优化时，锁屏久了系统会冻结 App */
+  refreshBattery() {
+    const el = $('battery-state');
+    if (!el) return;
+    if (!isNativeApp() || !window.AndroidTTS || !window.AndroidTTS.isIgnoringBattery) {
+      $('grp-battery').style.display = 'none';
+      return;
+    }
+    let ok = true;
+    try { ok = !!window.AndroidTTS.isIgnoringBattery(); } catch (e) { ok = true; }
+    el.textContent = ok ? '已加入白名单，锁屏可长时间播放' : '未加入白名单，锁屏久了可能被系统暂停';
+    el.style.color = ok ? '' : 'var(--danger)';
+    $('btn-battery').textContent = ok ? '去查看' : '去设置';
   },
 
   startListen() {
@@ -713,6 +740,7 @@ const app = {
     $(id).classList.add('open');
     if (id === 'sheet-tts') {
       this.fillVoices();
+      this.refreshBattery();
       if (isNativeApp() && window.__renderTtsTip) window.__renderTtsTip();
     }
   },
