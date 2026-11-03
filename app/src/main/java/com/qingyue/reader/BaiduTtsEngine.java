@@ -9,8 +9,8 @@ import android.util.Log;
 import java.io.File;
 import java.io.FileOutputStream;
 import java.net.URLEncoder;
-import java.nio.charset.StandardCharsets;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 
 import okhttp3.OkHttpClient;
 import okhttp3.Request;
@@ -20,6 +20,9 @@ import okhttp3.ResponseBody;
 /**
  * 百度翻译的语音合成接口（免费、无需 key），作为 Edge TTS 之外的第二条在线音色。
  * 纯 HTTP GET 返回 mp3，再用系统 MediaPlayer 播放，不涉及 native 库。
+ *
+ * v1.20：与 Edge 引擎一致引入会话代际 seq + 独立临时文件，
+ * 避免慢请求迟到后被当成当前句播放（两路声音重叠）。
  */
 public class BaiduTtsEngine {
     private static final String TAG = "QingyueBaiduTts";
@@ -32,7 +35,9 @@ public class BaiduTtsEngine {
             .build();
     private final Handler main = new Handler(Looper.getMainLooper());
 
+    private final AtomicInteger seq = new AtomicInteger(0);
     private volatile MediaPlayer player;
+    private volatile int playerGen = -1;
     private volatile boolean stopRequested = false;
     private volatile String lastError = "";
 
@@ -49,6 +54,7 @@ public class BaiduTtsEngine {
     }
 
     public void speak(String text, float rate, Callback cb) {
+        final int my = seq.incrementAndGet();
         stopRequested = false;
         lastError = "";
         String clean = text == null ? "" : text.trim();
@@ -75,73 +81,84 @@ public class BaiduTtsEngine {
                 .build();
         new Thread(() -> {
             try (Response resp = client.newCall(req).execute()) {
+                if (my != seq.get()) return;                 // 请求期间已被切句/停止
                 ResponseBody body = resp.body();
                 String type = resp.header("Content-Type", "");
                 if (!resp.isSuccessful() || body == null) {
                     lastError = "BaiduTts:" + resp.code();
-                    cb.onResult(false);
+                    if (my == seq.get()) cb.onResult(false);
                     return;
                 }
                 if (type != null && type.contains("json")) {
                     lastError = "BaiduTts:文本过长";
-                    cb.onResult(false);
+                    if (my == seq.get()) cb.onResult(false);
                     return;
                 }
                 byte[] mp3 = body.bytes();
-                if (stopRequested) { cb.onResult(false); return; }
+                if (my != seq.get() || stopRequested) return;
                 if (mp3.length < 1000) {
                     lastError = "BaiduTts:音频为空";
                     cb.onResult(false);
                     return;
                 }
-                play(mp3, cb);
+                play(mp3, cb, my);
             } catch (Throwable t) {
                 lastError = "BaiduTts:" + t;
                 Log.w(TAG, "speak failed " + t);
-                if (!stopRequested) cb.onResult(false);
+                if (my == seq.get() && !stopRequested) cb.onResult(false);
             }
         }, "qingyue-baidu-tts").start();
     }
 
-    private void play(byte[] mp3, Callback cb) {
+    private void play(byte[] mp3, Callback cb, final int my) {
+        if (my != seq.get()) return;
+        final File f = new File(ctx.getCacheDir(), "baidu_tts_" + my + ".mp3");
         try {
-            File f = new File(ctx.getCacheDir(), "baidu_tts.mp3");
             try (FileOutputStream out = new FileOutputStream(f)) {
                 out.write(mp3);
             }
-            main.post(() -> {
-                try {
-                    release();
-                    MediaPlayer p = new MediaPlayer();
-                    player = p;
-                    p.setDataSource(f.getAbsolutePath());
-                    p.setOnCompletionListener(mp -> {
-                        release();
-                        cb.onResult(true);
-                    });
-                    p.setOnErrorListener((mp, what, extra) -> {
-                        lastError = "MediaPlayer:" + what + "/" + extra;
-                        release();
-                        cb.onResult(false);
-                        return true;
-                    });
-                    p.prepare();
-                    p.start();
-                } catch (Throwable t) {
-                    lastError = "play:" + t;
-                    cb.onResult(false);
-                }
-            });
         } catch (Throwable t) {
             lastError = "write:" + t;
-            cb.onResult(false);
+            if (my == seq.get()) cb.onResult(false);
+            return;
         }
+        main.post(() -> {
+            if (my != seq.get()) { deleteQuiet(f); return; }
+            try {
+                release();                                   // 先停旧的一路，避免重叠
+                MediaPlayer p = new MediaPlayer();
+                player = p;
+                playerGen = my;
+                p.setDataSource(f.getAbsolutePath());
+                p.setOnCompletionListener(mp -> {
+                    if (my != seq.get()) return;
+                    release();
+                    deleteQuiet(f);
+                    cb.onResult(true);
+                });
+                p.setOnErrorListener((mp, what, extra) -> {
+                    lastError = "MediaPlayer:" + what + "/" + extra;
+                    if (my == seq.get()) release();
+                    deleteQuiet(f);
+                    if (my == seq.get()) cb.onResult(false);
+                    return true;
+                });
+                p.prepare();
+                p.start();
+            } catch (Throwable t) {
+                lastError = "play:" + t;
+                release();
+                deleteQuiet(f);
+                if (my == seq.get()) cb.onResult(false);
+            }
+        });
     }
 
     private void release() {
         try {
             MediaPlayer p = player;
             player = null;
+            playerGen = -1;
             if (p != null) {
                 try { if (p.isPlaying()) p.stop(); } catch (Exception ignore) {}
                 p.reset();
@@ -150,13 +167,20 @@ public class BaiduTtsEngine {
         } catch (Exception ignore) {}
     }
 
+    private static void deleteQuiet(File f) {
+        try { if (f != null && f.exists()) f.delete(); } catch (Throwable ignore) {}
+    }
+
     public void stop() {
+        seq.incrementAndGet();
         stopRequested = true;
-        main.post(this::release);
+        main.post(() -> {
+            if (playerGen != seq.get()) release();
+        });
     }
 
     public void shutdown() {
         stop();
-        release();
+        main.post(this::release);
     }
 }
