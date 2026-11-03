@@ -56,7 +56,7 @@ public class NativeTTS {
     private volatile boolean builtinReady = false;
     private volatile String builtinErr = "";   // 内置引擎初始化失败原因（诊断用）
     private static final String BUILTIN_NAME = "小燕 · 离线女声";
-    private static final String APP_VER = "v1.19";
+    private static final String APP_VER = "v1.20";
 
     /* 在线音色：微软 Edge TTS（免费、无需 key；纯 Java 实现，不碰 native） */
     private EdgeTtsEngine edge;
@@ -531,6 +531,17 @@ public class NativeTTS {
     @JavascriptInterface
     public void testSpeak() {
         final String vid = voiceId == null ? DEFAULT_VOICE_ID : voiceId;
+        // 正在朗读整章时不要另起试听，否则会出现两路声音重叠：
+        // 直接用新音色重读当前这一句即可，效果一样且不会叠音
+        if (qPlaying) {
+            main.post(() -> {
+                qToken++;
+                stopPlaybackInternal();
+                playAt(qIndex);
+            });
+            fireTest(true);
+            return;
+        }
         final String sample = "你好，这里是轻阅的语音试听，正在用「" + voiceDisplayName(vid) + "」为你朗读小说。";
         if (vid.startsWith("baidu:")) {
             baidu.speak(sample, rate, ok -> {
