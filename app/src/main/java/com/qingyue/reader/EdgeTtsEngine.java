@@ -3,6 +3,7 @@ package com.qingyue.reader;
 import android.content.Context;
 import android.media.MediaPlayer;
 import android.os.Handler;
+import android.os.PowerManager;
 import android.os.Looper;
 import android.util.Log;
 
@@ -223,6 +224,15 @@ public class EdgeTtsEngine {
                 MediaPlayer p = new MediaPlayer();
                 player = p;
                 playerGen = my;
+                // 播放期间由 MediaPlayer 自己持 PARTIAL_WAKE_LOCK：
+                // 比服务层的 WakeLock 更贴合，锁屏后音频回调不容易被系统掐断
+                try { p.setWakeMode(ctx, PowerManager.PARTIAL_WAKE_LOCK); } catch (Throwable ignore) { }
+                try {
+                    p.setAudioAttributes(new android.media.AudioAttributes.Builder()
+                            .setUsage(android.media.AudioAttributes.USAGE_MEDIA)
+                            .setContentType(android.media.AudioAttributes.CONTENT_TYPE_SPEECH)
+                            .build());
+                } catch (Throwable ignore) { }
                 p.setDataSource(f.getAbsolutePath());
                 p.setOnCompletionListener(mp -> {
                     if (my != seq.get()) return;                // 旧句播完，不要推进队列

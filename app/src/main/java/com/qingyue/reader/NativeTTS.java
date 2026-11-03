@@ -56,7 +56,7 @@ public class NativeTTS {
     private volatile boolean builtinReady = false;
     private volatile String builtinErr = "";   // 内置引擎初始化失败原因（诊断用）
     private static final String BUILTIN_NAME = "小燕 · 离线女声";
-    private static final String APP_VER = "v1.20";
+    private static final String APP_VER = "v1.21";
 
     /* 在线音色：微软 Edge TTS（免费、无需 key；纯 Java 实现，不碰 native） */
     private EdgeTtsEngine edge;
@@ -128,6 +128,26 @@ public class NativeTTS {
     };
     private volatile int qErrStreak = 0;
     private volatile int qLastNotified = -1;
+    private volatile long qLastAdvanceAt = 0;    // 上次真正推进句子/章节的时间
+
+    /**
+     * 卡死自恢复：锁屏 / Doze 时联网合成偶发无响应，回调永远不来，队列就僵在当前句。
+     * 每 20 秒检查一次，超过 120 秒没有任何推进就重读当前句。
+     */
+    private final Runnable qWatchdog = new Runnable() {
+        @Override public void run() {
+            if (!qPlaying) return;
+            if (!qPaused && qLastAdvanceAt > 0
+                    && System.currentTimeMillis() - qLastAdvanceAt > 120_000L) {
+                Log.w(TAG, "watchdog: 队列停滞超过 120s，重读当前句");
+                qLastAdvanceAt = System.currentTimeMillis();
+                qToken++;
+                stopPlaybackInternal();
+                playAt(qIndex);
+            }
+            main.postDelayed(this, 20_000);
+        }
+    };
 
     public static NativeTTS instance() {
         return INSTANCE;
@@ -192,10 +212,48 @@ public class NativeTTS {
             o.put("edgeErr", edgeErr == null ? "" : edgeErr);
             o.put("voiceId", voiceId == null ? DEFAULT_VOICE_ID : voiceId);
             o.put("voiceName", voiceDisplayName(voiceId == null ? DEFAULT_VOICE_ID : voiceId));
+            o.put("fgs", PlaybackService.foregroundOk);
+            o.put("fgsErr", safeStr(PlaybackService.lastError));
+            o.put("batteryOk", isIgnoringBattery());
             return o.toString();
         } catch (Exception e) {
             return "{\"ver\":\"" + APP_VER + "\",\"builtinReady\":false,\"builtinErr\":\"diag error\",\"engine\":\"\",\"zh\":false,\"voices\":0,\"ready\":false,\"modelInstalled\":false,\"modelProgress\":-1,\"modelMsg\":\"\"}";
         }
+    }
+
+    /* ---------------- 锁屏保活：电池优化白名单 ---------------- */
+
+    /** 是否已忽略电池优化（未忽略时，锁屏一段时间后系统可能冻结进程，听起来就是"停一下"） */
+    @JavascriptInterface
+    public boolean isIgnoringBattery() {
+        try {
+            if (Build.VERSION.SDK_INT < Build.VERSION_CODES.M) return true;
+            android.os.PowerManager pm =
+                    (android.os.PowerManager) appContext.getSystemService(Context.POWER_SERVICE);
+            return pm != null && pm.isIgnoringBatteryOptimizations(appContext.getPackageName());
+        } catch (Throwable t) {
+            return true;
+        }
+    }
+
+    /** 弹系统「忽略电池优化」授权框；个别 ROM 不支持时退到应用详情页 */
+    @JavascriptInterface
+    public void requestIgnoreBattery() {
+        try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                Intent i = new Intent(android.provider.Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS);
+                i.setData(Uri.parse("package:" + appContext.getPackageName()));
+                i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+                activity.startActivity(i);
+                return;
+            }
+        } catch (Throwable ignore) { }
+        try {
+            Intent i = new Intent(android.provider.Settings.ACTION_APPLICATION_DETAILS_SETTINGS);
+            i.setData(Uri.parse("package:" + appContext.getPackageName()));
+            i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+            activity.startActivity(i);
+        } catch (Throwable ignore) { }
     }
 
     /* ---------------- 离线语音包下载 ---------------- */
@@ -856,6 +914,9 @@ public class NativeTTS {
         PlaybackService.start(appContext);
         main.removeCallbacks(qTimerTick);
         if (qTimerEndAt > 0) main.postDelayed(qTimerTick, 1000);
+        qLastAdvanceAt = System.currentTimeMillis();
+        main.removeCallbacks(qWatchdog);
+        main.postDelayed(qWatchdog, 20_000);
 
         Log.i(TAG, "queue start: ch" + qChapter + " " + queue.size() + " 句, from " + qIndex
                 + ", 预排 " + qPending.size() + " 章");
@@ -935,6 +996,7 @@ public class NativeTTS {
         qPaused = false;
         qPending.clear();
         main.removeCallbacks(qMoreWait);
+        main.removeCallbacks(qWatchdog);
         main.removeCallbacks(qTimerTick);
         qTimerEndAt = 0;
         PlaybackService.stop(appContext);
@@ -948,6 +1010,7 @@ public class NativeTTS {
         final int total = queue.size();
         if (!force && idx == qLastNotified) return;
         qLastNotified = idx;
+        qLastAdvanceAt = System.currentTimeMillis();
         final boolean playing = qPlaying && !qPaused;
         if (qPlaying) {
             try {
@@ -1009,6 +1072,7 @@ public class NativeTTS {
             qPending.clear();
             qNeedWait = 0;
             main.removeCallbacks(qMoreWait);
+            main.removeCallbacks(qWatchdog);
             main.removeCallbacks(qTimerTick);
             stopPlaybackInternal();
             notifyProgress(true);

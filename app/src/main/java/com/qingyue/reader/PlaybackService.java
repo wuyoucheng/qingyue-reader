@@ -41,6 +41,10 @@ public class PlaybackService extends Service {
     private PowerManager.WakeLock wakeLock;
     private WifiManager.WifiLock wifiLock;
 
+    /** 前台服务是否真的生效（失败时锁屏大概率被冻结，用于诊断） */
+    public static volatile boolean foregroundOk = false;
+    public static volatile String lastError = "";
+
     /* ---------------- 对外静态入口 ---------------- */
 
     public static void start(Context ctx) {
@@ -91,7 +95,9 @@ public class PlaybackService extends Service {
 
     @Override
     public int onStartCommand(Intent intent, int flags, int startId) {
-        String action = intent == null ? ACTION_START : String.valueOf(intent.getAction());
+        // 系统重建服务（intent 为空）时播放状态已随进程消失，没有续播的意义
+        if (intent == null) { stopSelfSafely(); return START_NOT_STICKY; }
+        String action = String.valueOf(intent.getAction());
 
         if (ACTION_STOP.equals(action)) {
             // 通知栏「停止」按钮：同步让播放层停下来，再退出服务
@@ -106,19 +112,26 @@ public class PlaybackService extends Service {
             return START_NOT_STICKY;
         }
 
-        String title = intent == null ? "" : safe(intent.getStringExtra(EXTRA_TITLE));
-        String text = intent == null ? "" : safe(intent.getStringExtra(EXTRA_TEXT));
-        boolean playing = intent == null || intent.getBooleanExtra(EXTRA_PLAYING, true);
+        String title = intent.getStringExtra(EXTRA_TITLE) == null ? "" : safe(intent.getStringExtra(EXTRA_TITLE));
+        String text = intent.getStringExtra(EXTRA_TEXT) == null ? "" : safe(intent.getStringExtra(EXTRA_TEXT));
+        boolean playing = intent.getBooleanExtra(EXTRA_PLAYING, true);
 
         startForegroundCompat(title, text, playing);
         acquireLocks();
-        return START_NOT_STICKY;
+        return START_STICKY;
     }
 
     @Override
     public void onDestroy() {
+        Log.i(TAG, "onDestroy（锁屏保活结束）");
         releaseLocks();
         super.onDestroy();
+    }
+
+    @Override
+    public void onTaskRemoved(Intent rootIntent) {
+        // 用户从最近任务里划掉：不要顺带停掉朗读
+        super.onTaskRemoved(rootIntent);
     }
 
     @Override
@@ -174,7 +187,10 @@ public class PlaybackService extends Service {
             } else {
                 startForeground(NOTI_ID, n);
             }
+            foregroundOk = true;
         } catch (Throwable t) {
+            foregroundOk = false;
+            lastError = String.valueOf(t);
             Log.w(TAG, "startForeground failed: " + t);
         }
     }
@@ -202,9 +218,9 @@ public class PlaybackService extends Service {
                     wakeLock.setReferenceCounted(false);
                 }
             }
-            if (wakeLock != null && !wakeLock.isHeld()) {
-                wakeLock.acquire(3 * 60 * 60 * 1000L);   // 最长 3 小时，防止忘关
-            }
+            // 不加超时：带超时的锁在长时听到 3 小时后会静默失效，
+            // 表现就是「听很久之后锁屏会停」。释放由 stop / onDestroy 负责。
+            if (wakeLock != null && !wakeLock.isHeld()) wakeLock.acquire();
         } catch (Throwable t) {
             Log.w(TAG, "wakeLock: " + t);
         }
