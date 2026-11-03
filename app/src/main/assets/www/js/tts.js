@@ -1,6 +1,12 @@
 /**
- * tts.js — 系统语音朗读（Web Speech API）
- * 逐句朗读以规避 Chrome 长文本中断问题，支持高亮跟随、跨章续播、定时关闭、屏幕常亮
+ * tts.js — 朗读控制器
+ *
+ * 两种运行环境：
+ *  1) 安卓 APP（有 window.AndroidTTS）：**朗读由原生队列驱动**
+ *     JS 一次性把整章句子交给原生，原生自己「合成 → 播放 → 下一句」。
+ *     这样切后台 / 锁屏时网页被系统冻结也不影响播放（v1.18 起）。
+ *     JS 只负责：发起朗读、收进度回调做高亮、控制暂停/切句。
+ *  2) 普通浏览器：Web Speech API，逐句朗读。
  */
 
 const synth = window.speechSynthesis;
@@ -12,11 +18,13 @@ export class Speaker {
   constructor() {
     this.supported = !!synth || isNativeApp();
     this.native = isNativeApp() ? window.AndroidTTS : null;
+    this.queueMode = !!this.native;
     this.voices = [];
     this.playing = false;
     this.paused = false;
     this.sentences = [];
     this.index = 0;
+    this.total = 0;
     this.token = 0;
     this.wakeLock = null;
     this.timerMin = 0;
@@ -24,29 +32,96 @@ export class Speaker {
     this.timerId = null;
 
     this.hooks = {
-      getSentences: () => [],       // () => string[]
-      highlight: () => {},          // (index) => void
+      getSentences: () => [],          // () => string[]
+      getMeta: () => ({ book: '', chapter: '' }), // 用于通知栏显示
+      highlight: () => {},             // (index) => void
       onChapterEnd: async () => false, // 返回 true 表示已切到下一章并可继续
-      onState: () => {},            // ({playing,paused,text,index,total})
+      onState: () => {},
       onError: () => {},
     };
+
     if (this.native) {
+      // 原生队列回调
+      window.__ttsQueueProgress = (i, total, playing) => this.onQueueProgress(i, total, playing);
+      window.__ttsQueueEnd = () => this.onQueueEnd();
+      window.__ttsQueueError = msg => {
+        this.playing = false;
+        this.paused = false;
+        this.clearTimer();
+        this.hooks.onError(msg || '语音朗读失败');
+        this.emit();
+      };
+      // 通知栏「停止」
+      window.__ttsQueueStopped = () => {
+        this.playing = false;
+        this.paused = false;
+        this.clearTimer();
+        this.timerEndsAt = 0;
+        this.releaseWake();
+        this.hooks.highlight(-1);
+        this.emit();
+      };
+      // 原生定时关闭到点
+      window.__ttsTimerEnd = () => {
+        this.playing = false;
+        this.paused = false;
+        this.clearTimer();
+        this.timerEndsAt = 0;
+        this.releaseWake();
+        this.emit();
+        this.hooks.onError('定时关闭时间已到，朗读已停止');
+      };
       window.__ttsEvent = (type, id) => this.onNativeEvent(type, id);
     }
+
     this.loadVoices();
     if (!this.native && this.supported && typeof synth.onvoiceschanged !== 'undefined') {
       synth.onvoiceschanged = () => this.loadVoices();
     }
   }
 
-  /** 原生语音完成回调：done/error 时推进到下一句 */
+  /* ---------------- 原生队列回调 ---------------- */
+
+  onQueueProgress(i, total, playing) {
+    if (typeof i === 'number') this.index = i;
+    if (typeof total === 'number' && total > 0) this.total = total;
+    if (playing === false && this.playing && !this.paused) this.paused = true;
+    if (playing === true && !this.playing) this.playing = true;
+    this.hooks.highlight(this.index);
+    this.emit();
+  }
+
+  async onQueueEnd() {
+    if (!this.playing) return;
+    const moved = await this.hooks.onChapterEnd();
+    if (moved) {
+      this.sentences = this.hooks.getSentences() || [];
+      this.index = 0;
+      this.total = this.sentences.length;
+      setTimeout(() => { if (this.playing) this.startNativeQueue(0); }, 150);
+    } else {
+      this.playing = false;
+      this.clearTimer();
+      this.emit();
+    }
+  }
+
+  /** 兼容旧的单句事件（试听 / 浏览器路径） */
   onNativeEvent(type, id) {
+    if (this.queueMode) return;   // 队列模式下由 __ttsQueue* 驱动
     if (!this.playing || this.paused) return;
     if (String(id) !== String(this.token)) return;
-    if (type === 'done' || type === 'error') {
-      setTimeout(() => {
-        if (String(id) === String(this.token) && this.playing && !this.paused) this.speakAt(this.index + 1);
-      }, 30);
+    if (type === 'done') {
+      this.errStreak = 0;
+      setTimeout(() => this.speakAt(this.index + 1), 30);
+    } else if (type === 'error') {
+      this.errStreak = (this.errStreak || 0) + 1;
+      if (this.errStreak >= 3) {
+        this.stop();
+        this.hooks.onError('当前语音引擎没有可用的中文音色，请在听书面板里换一个在线音色');
+        return;
+      }
+      setTimeout(() => this.speakAt(this.index + 1), 30);
     }
   }
 
@@ -83,7 +158,8 @@ export class Speaker {
 
   on(events) { Object.assign(this.hooks, events); return this; }
 
-  /** 从指定句开始朗读当前章节 */
+  /* ---------------- 播放控制 ---------------- */
+
   async play(startIndex = -1, opt = {}) {
     if (!this.supported) { this.hooks.onError('当前浏览器不支持语音朗读'); return; }
     this.sentences = this.hooks.getSentences() || [];
@@ -93,10 +169,40 @@ export class Speaker {
 
     this.playing = true;
     this.paused = false;
+    this.errStreak = 0;
     this.opt = opt;
+    this.total = this.sentences.length;
+
     await this.requestWake(opt.keepAwake);
     this.setTimer(opt.timerMin || 0);
+
+    if (this.queueMode) {
+      this.startNativeQueue(this.index);
+      return;
+    }
     this.speakAt(this.index);
+  }
+
+  /** 把整章句子交给原生，由原生自己推进（后台/锁屏也能继续） */
+  startNativeQueue(from) {
+    const o = this.opt || {};
+    const meta = this.hooks.getMeta ? this.hooks.getMeta() : {};
+    try {
+      this.native.setRate(o.rate || 1);
+      this.native.setPitch(o.pitch || 1);
+      if (o.voiceURI) this.native.setVoice(o.voiceURI);
+      this.native.startQueue(
+        JSON.stringify(this.sentences), from,
+        meta.chapter || '', meta.book || '', o.timerMin || 0
+      );
+      this.playing = true;
+      this.paused = false;
+      this.emit();
+    } catch (e) {
+      this.playing = false;
+      this.hooks.onError('朗读启动失败：' + (e && e.message ? e.message : e));
+      this.emit();
+    }
   }
 
   speakAt(i) {
@@ -109,18 +215,14 @@ export class Speaker {
 
     if (!text || !text.trim()) { setTimeout(() => this.speakAt(i + 1), 0); return; }
 
-    const my = ++this.token;
-    const voiceURI = this.opt && this.opt.voiceURI;
-
-    // 安卓 APP：走原生 TextToSpeech
-    if (this.native) {
-      this.native.setRate(this.opt && this.opt.rate ? this.opt.rate : 1);
-      this.native.setPitch(this.opt && this.opt.pitch ? this.opt.pitch : 1);
-      if (voiceURI) this.native.setVoice(voiceURI);
-      this.native.speak(text, String(my));
+    if (this.native) {   // 非队列的旧路径（极少触发）
+      this.token++;
+      this.native.speak(text, String(this.token));
       return;
     }
 
+    const my = ++this.token;
+    const voiceURI = this.opt && this.opt.voiceURI;
     const u = new SpeechSynthesisUtterance(text);
     const v = this.findVoice(voiceURI);
     if (v) { u.voice = v; u.lang = v.lang; } else { u.lang = (this.opt && this.opt.lang) || 'zh-CN'; }
@@ -128,27 +230,54 @@ export class Speaker {
     u.pitch = this.opt && this.opt.pitch ? this.opt.pitch : 1;
     u.volume = 1;
 
-    const my = ++this.token;
     u.onend = () => {
       if (my !== this.token || !this.playing) return;
+      this.errStreak = 0;
       setTimeout(() => { if (my === this.token && this.playing && !this.paused) this.speakAt(i + 1); }, 30);
     };
     u.onerror = e => {
       if (my !== this.token) return;
-      if (e && e.error === 'interrupted') return;   // 用户主动停止
+      if (e && e.error === 'interrupted') return;
+      this.errStreak = (this.errStreak || 0) + 1;
+      if (this.errStreak >= 5) {
+        this.stop();
+        this.hooks.onError('语音朗读持续失败：当前环境可能没有可用的语音引擎');
+        return;
+      }
       setTimeout(() => { if (my === this.token && this.playing && !this.paused) this.speakAt(i + 1); }, 100);
     };
     try { synth.speak(u); } catch (e) { this.hooks.onError('语音朗读启动失败'); this.stop(); }
   }
 
-  /** 播放中动态修改语速/音色/定时：立即用新参数重读当前句 */
+  /** 播放中修改语速/音色/定时 */
   setOpt(patch) {
     this.opt = Object.assign({}, this.opt || {}, patch);
     if ('timerMin' in patch) this.setTimer(patch.timerMin);
-    if (this.playing && !this.paused) {
-      this.token++;
-      if (this.native) this.native.stop(); else { try { synth.cancel(); } catch (e) {} }
-      setTimeout(() => this.speakAt(this.index), 80);
+    const speedChanged = ('rate' in patch) || ('pitch' in patch) || ('voiceURI' in patch);
+    if (speedChanged && this.playing && !this.paused) {
+      if (this.queueMode) {
+        try {
+          if ('rate' in patch) this.native.setRate(patch.rate);
+          if ('pitch' in patch) this.native.setPitch(patch.pitch);
+          this.native.queueRestartCurrent();      // 用新参数重读当前句
+        } catch (e) { /* ignore */ }
+      } else {
+        this.token++;
+        if (this.native) this.native.stop(); else { try { synth.cancel(); } catch (e) {} }
+        setTimeout(() => this.speakAt(this.index), 80);
+      }
+    }
+    this.emit();
+  }
+
+  /** 换音色后重读当前句（播放中切换音色用） */
+  restartCurrent() {
+    if (!this.playing) return;
+    this.paused = false;
+    if (this.queueMode) {
+      try { this.native.queueRestartCurrent(); } catch (e) { /* ignore */ }
+    } else {
+      this.speakAt(this.index);
     }
     this.emit();
   }
@@ -156,7 +285,8 @@ export class Speaker {
   pause() {
     if (!this.playing || this.paused) return;
     this.paused = true;
-    if (this.native) this.native.stop();
+    if (this.queueMode) { try { this.native.pauseQueue(); } catch (e) {} }
+    else if (this.native) this.native.stop();
     else { try { synth.pause(); } catch (e) {} }
     this.emit();
   }
@@ -164,13 +294,10 @@ export class Speaker {
   resume() {
     if (!this.playing || !this.paused) return;
     this.paused = false;
-    if (this.native) {
-      this.speakAt(this.index);          // 原生 TTS 无 resume，重读当前句
-    } else {
-      try { synth.resume(); } catch (e) {
-        // 某些安卓机型 resume 无效，直接重读当前句
-        this.speakAt(this.index);
-      }
+    if (this.queueMode) { try { this.native.resumeQueue(); } catch (e) {} }
+    else if (this.native) this.speakAt(this.index);
+    else {
+      try { synth.resume(); } catch (e) { this.speakAt(this.index); }
     }
     this.emit();
   }
@@ -180,6 +307,7 @@ export class Speaker {
   stop(keepIndex = true) {
     this.playing = false;
     this.paused = false;
+    this.errStreak = 0;
     this.token++;
     if (this.native) this.native.stop();
     else { try { synth.cancel(); } catch (e) {} }
@@ -192,6 +320,11 @@ export class Speaker {
 
   next() {
     if (!this.playing) return;
+    if (this.queueMode) {
+      this.paused = false;
+      try { this.native.queueNext(); } catch (e) {}
+      return;
+    }
     this.token++;
     if (this.native) this.native.stop(); else { try { synth.cancel(); } catch (e) {} }
     setTimeout(() => this.speakAt(Math.min(this.index + 1, this.sentences.length - 1)), 40);
@@ -199,9 +332,28 @@ export class Speaker {
 
   prev() {
     if (!this.playing) return;
+    if (this.queueMode) {
+      this.paused = false;
+      try { this.native.queuePrev(); } catch (e) {}
+      return;
+    }
     this.token++;
     if (this.native) this.native.stop(); else { try { synth.cancel(); } catch (e) {} }
     setTimeout(() => this.speakAt(Math.max(this.index - 1, 0)), 40);
+  }
+
+  /** 跳到本章第 i 句 */
+  seek(i) {
+    if (!this.playing) return;
+    if (this.queueMode) {
+      this.index = i;
+      this.paused = false;
+      try { this.native.queueSeek(i); } catch (e) {}
+      this.emit();
+    } else {
+      this.token++;
+      this.speakAt(i);
+    }
   }
 
   async nextChapter() {
@@ -209,22 +361,32 @@ export class Speaker {
     if (moved) {
       this.sentences = this.hooks.getSentences() || [];
       this.index = 0;
-      setTimeout(() => this.speakAt(0), 120);
+      this.total = this.sentences.length;
+      setTimeout(() => {
+        if (this.queueMode) this.startNativeQueue(0);
+        else this.speakAt(0);
+      }, 120);
     } else {
       this.stop();
     }
   }
 
-  /* --- 定时关闭 --- */
+  /* --- 定时关闭：原生模式下由原生计时（后台 JS 定时器会被系统抑制） --- */
   setTimer(min) {
     this.clearTimer();
     this.timerMin = min || 0;
+    if (this.queueMode) {
+      try { this.native.setQueueTimer(this.timerMin); } catch (e) {}
+    }
     if (!min) { this.timerEndsAt = 0; this.emit(); return; }
     this.timerEndsAt = Date.now() + min * 60000;
+    // 仅用于界面倒计时显示；真正的停止由原生负责
     this.timerId = setInterval(() => {
       if (Date.now() >= this.timerEndsAt) {
-        this.stop();
-        this.hooks.onError('定时关闭时间已到，朗读停止');
+        this.clearTimer();
+        this.timerEndsAt = 0;
+        if (!this.queueMode) { this.stop(); this.hooks.onError('定时关闭时间已到，朗读停止'); }
+        else this.emit();
       } else this.emit();
     }, 1000);
   }
@@ -254,7 +416,7 @@ export class Speaker {
       playing: this.playing,
       paused: this.paused,
       index: this.index,
-      total: this.sentences.length,
+      total: this.total || this.sentences.length,
       text: this.playing ? (this.sentences[this.index] || '') : '',
       timer: this.timerLeftText(),
     });

@@ -10,17 +10,24 @@ android {
         applicationId "com.qingyue.reader"
         minSdk 26
         targetSdk 34
-        versionCode 2
-        versionName "1.5.0"
-        ndk {
-            // 内置 TTS 的 native 库只需 arm64（小米主流机型）；需要支持 32 位设备时加 armeabi-v7a
-            abiFilters 'arm64-v8a'
-        }
+        versionCode 21
+        versionName "1.18.0"
+        // 离线 native 语音引擎（sherpa-onnx）已从 App 移除：它在部分机型上加载即崩溃，
+        // 且需要 78MB 模型包。现在只有在线音色 + 系统语音两条路，均不含 native 库。
     }
 
+    // 语音模型约 78MB，不再打进 APK（100MB 的包在小米等机型上会「解析软件包失败」）。
+    // 改为运行时下载，这里确保 assets 里不再包含 tts 目录。
     androidResources {
-        // .onnx 模型不压缩，加快安装后复制与加载
-        noCompress += ['onnx', 'bin']
+        noCompress += ['onnx', 'bin', 'zip']
+        ignoreAssetsPattern = '!tts'
+    }
+
+    packagingOptions {
+        // so 压缩存储，APK 体积从 ~100MB 降到十几 MB
+        jniLibs {
+            useLegacyPackaging = true
+        }
     }
 
     buildTypes {
@@ -46,8 +53,8 @@ android {
 dependencies {
     implementation 'androidx.activity:activity:1.8.0'
     implementation 'androidx.webkit:webkit:1.8.0'
-    // 内置离线中文 TTS（sherpa-onnx + vits 中文女声模型，模型在 assets/tts/huayan）
-    implementation files('libs/sherpa-onnx.aar')
+    // 在线音色（微软 Edge TTS，WebSocket 流式合成）
+    implementation 'com.squareup.okhttp3:okhttp:4.12.0'
 }
 
 // 统一 kotlin-stdlib 版本，避免 jdk7/jdk8 旧包重复类导致构建失败

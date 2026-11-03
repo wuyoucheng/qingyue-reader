@@ -1,128 +1,44 @@
 package com.qingyue.reader;
 
-import android.content.Context;
-import android.media.AudioAttributes;
-import android.media.AudioFormat;
-import android.media.AudioManager;
-import android.media.AudioTrack;
-import android.util.Log;
-
-import com.k2fsa.sherpa.onnx.OfflineTts;
-import com.k2fsa.sherpa.onnx.OfflineTtsConfig;
-import com.k2fsa.sherpa.onnx.OfflineTtsModelConfig;
-import com.k2fsa.sherpa.onnx.OfflineTtsVitsModelConfig;
-
 /**
- * 内置离线中文 TTS：sherpa-onnx + vits-piper 中文女声（小燕）。
- * 模型随 APK 打包（assets/tts/huayan），不依赖系统语音引擎与联网。
+ * 原「内置离线语音（sherpa-onnx + 小燕）」。
+ *
+ * 已移除：该 native 引擎在部分机型（含小米 HyperOS）加载即发生原生崩溃（SIGSEGV），
+ * Java 层无法捕获；还需额外下载 78MB 语音包，下载/解压又会带来崩溃与占用。
+ * 现在只有两条不涉 native 的路线：在线音色（Edge TTS）与系统 TTS。
+ *
+ * 本类保留同样的接口名，让上层调用点无需改动，但始终返回「不可用」。
  */
 public class OfflineTtsEngine {
 
-    private static final String TAG = "OfflineTts";
-
-    public interface Callback { void onDone(boolean ok); }
-
-    private OfflineTts tts;
-    private volatile boolean playing = false;
-    private volatile AudioTrack track;
-    private Thread worker;
-    private int sampleRate = 22050;
-    private volatile String lastError = "";   // 最近一次初始化/合成失败的错误描述
-
-    /** 加载模型（首次约 1~2 秒），成功返回 true */
-    public boolean init(Context ctx) {
-        try {
-            OfflineTtsVitsModelConfig vits = new OfflineTtsVitsModelConfig(
-                    "tts/huayan/zh_CN-huayan-medium.onnx",  // model
-                    "",                                      // lexicon（piper 用 espeak，不需要）
-                    "tts/huayan/tokens.txt",                 // tokens
-                    "tts/huayan/espeak-ng-data",             // dataDir（音素化数据）
-                    "",                                      // dictDir
-                    0.667f, 0.8f, 1.0f);
-            OfflineTtsModelConfig mc = new OfflineTtsModelConfig(vits, null, null, 2, false, "cpu");
-            // 参数：modelConfig, ruleFsts, ruleFars, maxSentenceLength(必须>1，用默认值量级), silenceScale
-            OfflineTtsConfig cfg = new OfflineTtsConfig(mc, "", "", 500, 1.0f);
-            long t0 = System.currentTimeMillis();
-            tts = new OfflineTts(ctx.getAssets(), cfg);
-            sampleRate = tts.sampleRate();
-            Log.i(TAG, "init ok, sr=" + sampleRate + ", " + (System.currentTimeMillis() - t0) + "ms");
-            return true;
-        } catch (Throwable t) {
-            Log.w(TAG, "init: " + t);
-            lastError = String.valueOf(t);
-            tts = null;
-            return false;
-        }
+    public interface Callback {
+        void onResult(boolean ok);
     }
 
-    public boolean isReady() { return tts != null; }
-
-    public String getLastError() { return lastError == null ? "" : lastError; }
-
-    public int getSampleRate() { return sampleRate; }
-
-    /** 合成并播放一句；结束/失败/被停止后回调（合成在独立线程，回调线程随机） */
-    public synchronized void speak(final String text, final float speed, final Callback cb) {
-        stop();
-        if (tts == null) { cb.onDone(false); return; }
-        playing = true;
-        worker = new Thread(() -> {
-            boolean ok = false;
-            final AudioTrack[] holder = new AudioTrack[1];
-            try {
-                holder[0] = new AudioTrack(
-                        new AudioAttributes.Builder()
-                                .setUsage(AudioAttributes.USAGE_MEDIA)
-                                .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
-                                .build(),
-                        new AudioFormat.Builder()
-                                .setEncoding(AudioFormat.ENCODING_PCM_FLOAT)
-                                .setSampleRate(sampleRate)
-                                .setChannelMask(AudioFormat.CHANNEL_OUT_MONO)
-                                .build(),
-                        Math.max(sampleRate * 4, 65536),   // 缓冲：约 0.5s
-                        AudioTrack.MODE_STREAM,
-                        AudioManager.AUDIO_SESSION_ID_GENERATE);
-                final AudioTrack t = holder[0];
-                track = t;
-                t.play();
-                // 流式合成：每生成一块就写入播放缓冲；回调返回 0 让引擎停止生成
-                tts.generateWithCallback(text, 0, speed <= 0 ? 1.0f : speed, (float[] chunk) -> {
-                    if (!playing || t == null || t.getPlayState() != AudioTrack.PLAYSTATE_PLAYING) {
-                        return Integer.valueOf(0);
-                    }
-                    t.write(chunk, 0, chunk.length, AudioTrack.WRITE_BLOCKING);
-                    return Integer.valueOf(1);
-                });
-                ok = playing;
-            } catch (Throwable e) {
-                Log.w(TAG, "speak: " + e);
-                lastError = String.valueOf(e);
-                ok = false;
-            } finally {
-                try { if (holder[0] != null) { holder[0].stop(); holder[0].release(); } } catch (Exception ignore) {}
-                if (track == holder[0]) track = null;
-                playing = false;
-            }
-            final boolean okF = ok;
-            if (cb != null) cb.onDone(okF);
-        }, "qingyue-tts");
-        worker.start();
+    /** 保留兼容：历史上通过它查询模型状态 */
+    public static boolean modelInstalled(android.content.Context ctx) {
+        return false;
     }
 
-    /** 立即停止当前播放与合成 */
-    public synchronized void stop() {
-        playing = false;
-        AudioTrack t = track;
-        if (t != null) {
-            try { t.pause(); t.flush(); } catch (Exception ignore) {}
-        }
-        if (worker != null) worker.interrupt();
+    public boolean init(android.content.Context ctx) {
+        return false;
+    }
+
+    public boolean isReady() {
+        return false;
+    }
+
+    public void speak(String text, float rate, Callback cb) {
+        if (cb != null) cb.onResult(false);
+    }
+
+    public void stop() {
     }
 
     public void shutdown() {
-        stop();
-        try { if (tts != null) tts.release(); } catch (Exception ignore) {}
-        tts = null;
+    }
+
+    public String getLastError() {
+        return "离线语音引擎已移除";
     }
 }

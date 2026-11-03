@@ -345,6 +345,10 @@ public class MainActivity extends ComponentActivity {
         // 先装崩溃记录器，任何未捕获异常都会写进 filesDir/crash.log
         CrashLogger.install(getApplicationContext());
 
+        // 崩溃熔断：上次进程异常退出（原生崩溃/低内存/朗读中死掉）时，
+        // 自动停用内置离线语音，避免「打开就闪退、一直闪退」
+        TtsGuard.check(getApplicationContext());
+
         getWindow().setStatusBarColor(0xFFF7F3E8);
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
             getWindow().getDecorView().setSystemUiVisibility(View.SYSTEM_UI_FLAG_LIGHT_STATUS_BAR);
@@ -475,6 +479,16 @@ public class MainActivity extends ComponentActivity {
         } else {
             webView.restoreState(savedInstanceState);
         }
+
+        // 听书前台服务需要通知权限（Android 13+）：不授权也能播，但锁屏后没有常驻通知可停止
+        if (Build.VERSION.SDK_INT >= 33) {
+            try {
+                if (checkSelfPermission("android.permission.POST_NOTIFICATIONS")
+                        != android.content.pm.PackageManager.PERMISSION_GRANTED) {
+                    requestPermissions(new String[]{"android.permission.POST_NOTIFICATIONS"}, 9);
+                }
+            } catch (Throwable ignore) { }
+        }
     }
 
     @Override
@@ -503,13 +517,20 @@ public class MainActivity extends ComponentActivity {
     @Override
     protected void onPause() {
         super.onPause();
-        if (webView != null) webView.onPause();
+        // 注意：不要在这里调用 webView.onPause()。
+        // 它会暂停 WebView 的 JS 定时器与渲染，切后台后朗读队列（逐句推进 / 跨章续播）立刻停住。
+        // 朗读本身已由原生队列 + 前台服务承担，页面保持运行只是为了让高亮与跨章逻辑继续工作。
     }
 
     @Override
     protected void onResume() {
         super.onResume();
-        if (webView != null) webView.onResume();
+        if (webView != null) {
+            try { webView.onResume(); } catch (Exception ignore) { }
+            try { webView.resumeTimers(); } catch (Exception ignore) { }
+        }
+        // 回到前台时同步一次朗读进度（后台期间网页可能没收到回调）
+        if (nativeTTS != null) nativeTTS.notifyPageReady();
     }
 
     @Override

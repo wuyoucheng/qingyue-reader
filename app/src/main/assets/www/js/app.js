@@ -60,22 +60,36 @@ const app = {
         if (!d) return;
         const act = `style="color:#4a63d9;font-weight:600"`;
         const ver = d.ver ? ` <span style="opacity:.55;font-size:11px">轻阅 ${d.ver}</span>` : '';
+        const downloading = d.modelProgress !== undefined && d.modelProgress !== null && d.modelProgress >= 0;
+        if (downloading) {
+          const p = Math.max(0, Math.min(100, d.modelProgress));
+          tip.innerHTML = `<div style="margin-bottom:6px">正在下载离线语音包 <b>${p}%</b>　<span style="opacity:.65">${escapeHtml(d.modelMsg || '')}</span></div>` +
+            `<div style="height:6px;border-radius:3px;background:rgba(120,135,180,.22);overflow:hidden">` +
+            `<div style="height:100%;width:${p}%;background:#4a63d9;transition:width .3s"></div></div>`;
+          return;
+        }
         if (d.builtinReady) {
           tip.innerHTML = `当前语音引擎：<b>${escapeHtml(d.engine || '内置离线语音')}</b>（内置·离线可用） · ` +
             `<a href="javascript:void(0)" data-tts-act="test" ${act}>试听</a>` + ver;
-        } else if (d.builtinErr) {
-          tip.innerHTML = `⚠️ 内置语音引擎加载失败：<b>${escapeHtml(String(d.builtinErr).slice(0, 140))}</b> · ` +
-            `<a href="javascript:void(0)" data-tts-act="refresh" ${act}>重新加载</a>` + ver;
+        } else if (d.edgeOn) {
+          const eStr = d.edgeErr ? String(d.edgeErr) : '';
+          const is403 = /403/i.test(eStr);
+          const bad = eStr ? ` <span style="color:#c0392b">· 上次合成失败：${escapeHtml(eStr.slice(0, 60))}${is403 ? '（网络被拒，可换「百度女声」试试）' : ''}</span>` : '';
+          tip.innerHTML = `当前音色：<b>${escapeHtml(d.voiceName || '晓晓')}</b>（在线合成，需联网）${bad} · ` +
+            `<a href="javascript:void(0)" data-tts-act="test" ${act}>试听</a>` +
+            (d.zh ? ` · <a href="javascript:void(0)" data-tts-act="edgeoff" ${act}>改用系统语音</a>` : '') + ver;
         } else if (d.zh) {
           tip.innerHTML = `当前语音引擎：<b>${escapeHtml(d.engine || '系统默认')}</b>` +
             `${d.voices ? `（${d.voices} 个音色）` : ''} · ` +
+            `<a href="javascript:void(0)" data-tts-act="edgeon" ${act}>用在线音色「晓晓」</a> · ` +
             `<a href="javascript:void(0)" data-tts-act="choose" ${act}>更换引擎</a> · ` +
             `<a href="javascript:void(0)" data-tts-act="test" ${act}>试听</a>` + ver;
         } else {
-          tip.innerHTML = `⚠️ 当前引擎 <b>${escapeHtml(d.engine || '系统默认')}</b> 未检测到中文语音。` +
-            `<a href="javascript:void(0)" data-tts-act="choose" ${act}>更换引擎</a> 或 ` +
-            `<a href="javascript:void(0)" data-tts-act="market" ${act}>去应用商店安装中文语音包</a>（讯飞语记 / Google 文字转语音等），` +
-            `装好后点 <a href="javascript:void(0)" data-tts-act="refresh" ${act}>重新检测</a>，再 <a href="javascript:void(0)" data-tts-act="test" ${act}>试听</a> 验证` + ver;
+          // 离线语音包已移除：系统里没中文引擎时，直接引导用在线音色
+          tip.innerHTML = `⚠️ 系统里没有可用的中文语音引擎。建议 ` +
+            `<a href="javascript:void(0)" data-tts-act="edgeon" ${act}>使用在线音色「晓晓」</a>` +
+            `（联网即可，无需安装引擎）；或 ` +
+            `<a href="javascript:void(0)" data-tts-act="market" ${act}>去应用商店装中文语音引擎</a>` + ver;
         }
         tip.querySelectorAll('[data-tts-act]').forEach(a => {
           a.addEventListener('click', () => {
@@ -85,11 +99,37 @@ const app = {
               else if (act2 === 'settings') window.AndroidTTS.openTtsSettings();
               else if (act2 === 'market') { this.toast('安装中文语音引擎后回来点「重新检测」'); window.AndroidTTS.openMarket(); }
               else if (act2 === 'refresh') { this.toast('正在重新加载语音引擎…'); window.AndroidTTS.reinit(); }
+              else if (act2 === 'edgeoff') { window.AndroidTTS.setEdge(false); this.toast('已改用系统语音'); setTimeout(ttsTip, 400); }
+              else if (act2 === 'edgeon') { window.AndroidTTS.setEdge(true); this.toast('已切换到在线音色「晓晓」'); setTimeout(ttsTip, 800); }
+              else if (act2 === 'reload') { this.toast('正在重新检测系统语音…'); window.AndroidTTS.reinit(); }
+              else if (act2 === 'enablebi') { this.toast('正在开启离线语音（实验）…'); window.AndroidTTS.enableBuiltin(); setTimeout(ttsTip, 1500); setTimeout(ttsTip, 5000); }
+              else if (act2 === 'disablebi') { window.AndroidTTS.disableBuiltin(); this.toast('已改用系统语音'); setTimeout(ttsTip, 500); }
+              else if (act2 === 'reset') {
+                if (confirm('会删除已下载的离线语音包（约 78MB），下次需要重新下载。确定吗？')) {
+                  try { window.AndroidTTS.resetModel(); } catch (e) { /* ignore */ }
+                  this.toast('已删除，可重新下载语音包');
+                  setTimeout(ttsTip, 500);
+                } else {
+                  setTimeout(ttsTip, 100);
+                }
+              }
+              else if (act2 === 'download') {
+                this.toast('离线语音包已移除，请直接使用在线音色「晓晓」或系统语音');
+              }
+              else if (act2 === 'crashlog') {
+                try {
+                  const s = String(window.AndroidTTS.getCrashLog() || '').replace(/⏎/g, '\n').trim();
+                  if (!s) { this.toast('暂无崩溃日志'); return; }
+                  this.copyText(s).then(ok => {
+                    this.toast(ok ? '崩溃日志已复制，回聊天里粘贴发我即可' : '复制失败，日志：' + s.slice(0, 200));
+                  });
+                } catch (e) { this.toast('读取日志失败'); }
+              }
               else if (act2 === 'test') { this.toast('正在试听…'); window.AndroidTTS.testSpeak(); }
             } catch (e) { /* ignore */ }
           });
         });
-        if (d.builtinReady) this.fillVoices();
+        this.fillVoices();
       };
       window.__ttsState = () => ttsTip();
       window.__ttsTest = ok => {
@@ -97,10 +137,31 @@ const app = {
         ttsTip();
       };
       window.__renderTtsTip = ttsTip;
+      // 原生下载语音包的进度推送
+      window.__onModel = st => {
+        try {
+          if (st && st.installed) {
+            if (!this.__modelWasInstalled) {
+              this.__modelWasInstalled = true;
+              this.toast('✅ 离线语音包已就绪');
+            }
+          } else if (st && st.progress === -1 && st.msg && String(st.msg).indexOf('失败') >= 0) {
+            this.toast('下载失败：' + st.msg);
+          }
+        } catch (e) { /* ignore */ }
+        ttsTip();
+        setTimeout(ttsTip, 1500);
+        setTimeout(ttsTip, 4000);
+      };
+      try {
+        const s0 = JSON.parse(window.AndroidTTS.modelStatus() || '{}');
+        this.__modelWasInstalled = !!s0.installed;
+      } catch (e) { /* ignore */ }
       // 首次渲染；内置引擎模型是异步加载的（1~2 秒），加载前后多刷几次确保提示跟上
       ttsTip();
       setTimeout(ttsTip, 800);
       setTimeout(ttsTip, 2500);
+      setTimeout(ttsTip, 6000);
     }
 
     // 安卓 APP 环境适配：返回键接管、隐藏「添加到桌面」引导
@@ -487,6 +548,52 @@ const app = {
   },
 
   fillVoices() {
+    // 安卓 APP：用原生音色表渲染卡片网格（在线多音色 + 系统语音）
+    if (isNativeApp() && window.AndroidTTS && window.AndroidTTS.getVoiceList) {
+      const grid = $('voice-grid');
+      const sel = $('tts-voice');
+      if (!grid) return;
+      try {
+        let list = [];
+        try { list = JSON.parse(window.AndroidTTS.getVoiceList() || '[]'); } catch (e) { list = []; }
+        if (!list.length) { grid.hidden = true; sel.hidden = false; return; }
+        let cur = '';
+        try { cur = window.AndroidTTS.getVoiceId() || ''; } catch (e) { cur = ''; }
+        sel.hidden = true;
+        grid.hidden = false;
+        const online = list.filter(v => v.group === 'online');
+        const system = list.filter(v => v.group === 'system');
+        const card = v => `<button class="voice-card ${v.id === cur ? 'on' : ''}" data-vid="${escapeHtml(v.id)}">` +
+          `<b>${escapeHtml(v.name)}</b><span>${escapeHtml(v.desc || '')}</span></button>`;
+        grid.innerHTML =
+          `<div class="voice-sec" style="grid-column:1/-1">在线音色 · 需联网</div>` +
+          online.map(card).join('') +
+          (system.length ? `<div class="voice-sec" style="grid-column:1/-1">系统语音 · 离线</div>` + system.map(card).join('') : '') +
+          `<div class="voice-sec" style="grid-column:1/-1">离线音色需要在系统里安装中文语音引擎；本机未检测到，故暂不提供离线音色下载</div>`;
+        grid.querySelectorAll('[data-vid]').forEach(btn => {
+          btn.addEventListener('click', () => {
+            const vid = btn.dataset.vid;
+            try { window.AndroidTTS.setVoiceId(vid); } catch (e) { /* ignore */ }
+            grid.querySelectorAll('.voice-card').forEach(b => b.classList.toggle('on', b === btn));
+            this.toast(`已切换到「${btn.querySelector('b').textContent}」`);
+            if (reader.speaker.playing) {
+              // 正在朗读：直接用新音色重读当前句（不打断阅读节奏）
+              reader.speaker.restartCurrent();
+            } else {
+              try { window.AndroidTTS.testSpeak(); } catch (e) { /* ignore */ }
+            }
+            if (window.__renderTtsTip) setTimeout(window.__renderTtsTip, 400);
+          });
+        });
+        return;
+      } catch (e) {
+        // 任何异常都退回系统音色下拉，保证面板还能用
+        grid.hidden = true;
+        sel.hidden = false;
+      }
+    }
+
+    // 浏览器 / PWA：退回系统音色下拉
     const sel = $('tts-voice');
     const opts = reader.speaker.voiceOptions();
     sel.innerHTML = '';
@@ -604,7 +711,10 @@ const app = {
   openSheet(id) {
     document.querySelectorAll('.sheet').forEach(s => s.classList.remove('open'));
     $(id).classList.add('open');
-    if (id === 'sheet-tts' && isNativeApp() && window.__renderTtsTip) window.__renderTtsTip();
+    if (id === 'sheet-tts') {
+      this.fillVoices();
+      if (isNativeApp() && window.__renderTtsTip) window.__renderTtsTip();
+    }
   },
   closeSheets() {
     document.querySelectorAll('.sheet').forEach(s => s.classList.remove('open'));
@@ -616,6 +726,25 @@ const app = {
     t.classList.add('show');
     clearTimeout(this._t);
     this._t = setTimeout(() => t.classList.remove('show'), 2000);
+  },
+
+  async copyText(s) {
+    try {
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        await navigator.clipboard.writeText(s);
+        return true;
+      }
+    } catch (e) { /* fallthrough */ }
+    try {
+      const ta = document.createElement('textarea');
+      ta.value = s;
+      ta.style.cssText = 'position:fixed;opacity:0;top:0;left:0';
+      document.body.appendChild(ta);
+      ta.select();
+      const ok = document.execCommand('copy');
+      ta.remove();
+      return ok;
+    } catch (e) { return false; }
   },
 };
 
