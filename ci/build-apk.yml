@@ -1,0 +1,44 @@
+name: Build Android APK
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+
+      - name: Set up Gradle 8.5
+        run: |
+          curl -sL -o /tmp/gradle.zip https://services.gradle.org/distributions/gradle-8.5-bin.zip
+          sudo unzip -q -o /tmp/gradle.zip -d /opt
+          sudo chmod +x /opt/gradle-8.5/bin/gradle
+          echo "/opt/gradle-8.5/bin" >> $GITHUB_PATH
+
+      - name: Prepare Android SDK
+        run: |
+          echo "ANDROID_HOME=$ANDROID_HOME"
+          yes | sdkmanager --licenses > /dev/null 2>&1 || true
+          sdkmanager --install "platforms;android-34" "build-tools;34.0.0" > /dev/null 2>&1 || true
+          sdkmanager --list_installed 2>/dev/null | head -20 || true
+        continue-on-error: true
+
+      - name: Build debug APK
+        run: gradle assembleDebug --no-daemon --stacktrace
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: qingyue-reader-apk
+          path: app/build/outputs/apk/debug/*.apk
+          if-no-files-found: error
