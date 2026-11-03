@@ -46,10 +46,14 @@ export const reader = {
 
     this.speaker.on({
       getSentences: () => this.sentences,
+      getMeta: () => ({
+        book: this.book ? this.book.title : '',
+        chapter: this.titles[this.chapterIndex] ? this.titles[this.chapterIndex].title : '',
+      }),
       highlight: i => this.highlight(i),
       onChapterEnd: async () => {
         if (this.chapterIndex + 1 < this.titles.length) {
-          await this.loadChapter(this.chapterIndex + 1, { toTop: true });
+          await this.loadChapter(this.chapterIndex + 1, { toTop: true, auto: true });
           return true;
         }
         return false;
@@ -105,6 +109,8 @@ export const reader = {
 
   async loadChapter(index, opt = {}) {
     if (!this.book) return;
+    // 手动翻章/跳转时停掉朗读；自动跨章续播（opt.auto）则保持播放
+    if (!opt.auto && this.speaker && this.speaker.playing) this.speaker.stop();
     index = Math.max(0, Math.min(index, this.titles.length - 1));
     this.chapterIndex = index;
     const ch = await db.getChapter(this.book.id, index);

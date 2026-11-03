@@ -7,3 +7,8 @@ app/build/
 captures/
 .externalNativeBuild/
 .cxx/
+
+# 已弃用的 sherpa-onnx 离线引擎（v1.16 起完全移除，仅本地残留 36MB）
+app/libs/
+# 本机测试用的语音模型（78MB，不入库）
+models/
