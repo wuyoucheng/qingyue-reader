@@ -84,13 +84,21 @@ export const reader = {
       timer = setTimeout(() => this.saveProgress(), 350);
     }, { passive: true });
 
+    // 用户自己动手了就放弃自动定位，避免"回位"跟用户抢滚动条
+    const markUser = () => { if (!this._restoring) this._userScrolled = true; };
+    ['touchstart', 'wheel', 'mousedown', 'keydown'].forEach(ev =>
+      this.el.scroll.addEventListener(ev, markUser, { passive: true }));
+
     window.addEventListener('resize', () => {
       if (settings.scrollMode === 'page') this.measurePages();
     });
 
+    // 退出/切后台/被系统杀掉前都存一次
     document.addEventListener('visibilitychange', () => {
-      if (document.hidden) this.saveProgress();
+      if (document.hidden) this.saveProgress(true);
     });
+    window.addEventListener('pagehide', () => this.saveProgress(true));
+    window.addEventListener('beforeunload', () => this.saveProgress(true));
   },
 
   /* ---------------- 打开书籍 ---------------- */
@@ -106,7 +114,7 @@ export const reader = {
     this.applyStyle();
     const p = book.progress || {};
     const idx = Math.min(Math.max(0, p.chapterIndex || 0), this.titles.length - 1);
-    await this.loadChapter(idx, { block: p.blockIndex || 0 });
+    await this.loadChapter(idx, { block: p.blockIndex || 0, ratio: p.ratio || 0, restore: true });
     return true;
   },
 
@@ -183,31 +191,91 @@ export const reader = {
 
     this.el.scroll.scrollTop = 0;
     this.page = 0;
+    this._userScrolled = false;
 
-    requestAnimationFrame(() => {
-      if (settings.scrollMode === 'page') {
-        this.measurePages();
-        if (opt.block) {
-          const el = this.el.text.querySelector(`.sent[data-i="${opt.block}"]`);
-          if (el) this.page = Math.max(0, Math.round(el.offsetLeft / (this.step || 1)));
-          this.goPage(this.page);
-        }
-      } else if (opt.block) {
-        const el = this.el.text.querySelector(`.sent[data-i="${opt.block}"]`);
-        if (el) {
-          const r = el.getBoundingClientRect(), sr = this.el.scroll.getBoundingClientRect();
-          this.el.scroll.scrollTop = Math.max(0, r.top - sr.top + this.el.scroll.scrollTop - 8);
-        }
-      }
-      this.updateProgressBar();
-      this.saveProgress();
-    });
+    const wantBlock = opt.block > 0 ? opt.block : 0;
+    const wantRatio = opt.ratio > 0 ? opt.ratio : 0;
+    const needRestore = wantBlock > 0 || wantRatio > 0.02 || opt.restore;
+    this._want = needRestore ? { block: wantBlock, ratio: wantRatio } : null;
+
+    if (needRestore) this.restoreTo(wantBlock, wantRatio);
+    else requestAnimationFrame(() => { requestAnimationFrame(() => this.afterRender()); });
 
     if (this.speaker.playing) {
       // 句子表更新为当前显示章；index 由原生进度回调驱动，这里不重置
       this.speaker.sentences = this.sentences;
     }
   },
+
+  /**
+   * 回到上次位置。
+   * 真机上章节内容长、字体/布局可能还没稳定，一次 scrollTop 赋值会被夹回 0，
+   * 所以这里按「先抢一次，再逐步重试」的方式做，并且用比例兜底。
+   */
+  async restoreTo(block, ratio) {
+    const sc = this.el.scroll;
+    const pm = settings.scrollMode === 'page';
+    this._restoring = true;
+    const delays = [0, 60, 150, 320, 650];
+    let ok = false;
+
+    for (let k = 0; k < delays.length && !ok; k++) {
+      if (delays[k]) await new Promise(r => setTimeout(r, delays[k]));
+      if (this._userScrolled) break;      // 用户已经开始读了，不再动
+      if (k === 3 && document.fonts && document.fonts.ready) {
+        try { await document.fonts.ready; } catch (e) {}
+      }
+
+      if (pm) {
+        this.measurePages(true);
+        if (this.pages <= 1) continue;      // 还没测量出页数，等下一轮
+        const el = block > 0 ? this.spans[block] : null;
+        let p = el ? Math.round(el.offsetLeft / (this.step || 1)) : 0;
+        // offsetLeft 在多列布局里不一定可靠，block 定位失败就用比例
+        if ((p <= 0 || p >= this.pages) && ratio > 0.02) p = Math.round(ratio * (this.pages - 1));
+        p = Math.max(0, Math.min(this.pages - 1, p));
+        this.page = p;
+        this.el.content.style.transition = 'none';
+        this.el.content.style.transform = `translateX(${-p * this.step}px)`;
+        ok = p > 0;
+        if (ok) requestAnimationFrame(() => { this.el.content.style.transition = ''; });
+      } else {
+        const max = sc.scrollHeight - sc.clientHeight;
+        if (max <= 0) continue;                        // 版面还没出来，继续等
+        const el = block > 0 ? this.spans[block] : null;
+        let y = 0;
+        if (el) {
+          const r = el.getBoundingClientRect(), sr = sc.getBoundingClientRect();
+          y = r.top - sr.top + sc.scrollTop - 8;
+        } else if (ratio > 0.02) {
+          y = ratio * max;
+        }
+        y = Math.max(0, Math.min(max, Math.round(y)));
+        sc.scrollTop = y;
+        // 赋值被夹回 0（版面未就绪）或已经到位，都算这一轮结束
+        ok = y === 0 || Math.abs(sc.scrollTop - y) <= 24;
+        if (!ok) sc.scrollTop = y;
+      }
+    }
+
+    this._restoring = false;
+    this._userScrolled = false;
+    this.afterRender();
+  },
+
+  afterRender() {
+    this.updateProgressBar();
+    const w = this._want;
+    if (w && (w.block > 0 || w.ratio > 0.02)) {
+      const atTop = settings.scrollMode === 'page'
+        ? this.page === 0
+        : this.el.scroll.scrollTop < 4;
+      // 没能回到原位置就别存，避免把已有的位置覆盖成 0
+      if (atTop) return;
+    }
+    this.saveProgress(true);
+  },
+
 
   /* ---------------- 样式 ---------------- */
   applyStyle() {
@@ -282,8 +350,10 @@ export const reader = {
     return res;
   },
 
-  async saveProgress() {
+  async saveProgress(force) {
     if (!this.book || !this.chapter) return;
+    // 正在回位的过程中不要存，否则会把刚恢复的位置写回 0
+    if (this._restoring && !force) return;
     const ratio = this.currentRatio();
     const block = this.currentBlock();
     const before = this.charsBefore[this.chapterIndex] || 0;
@@ -398,9 +468,13 @@ export const reader = {
 /* 自动进入下一章：滚到底部后继续下滑即触发 */
 (() => {
   const sc = $('rd-scroll');
-  let lastTop = 0, lock = 0;
+  let lastTop = 0, lock = 0, lastChapter = -1;
   sc.addEventListener('scroll', () => {
     if (!settings.autoNext || settings.scrollMode === 'page' || !reader.book) return;
+    // 程序在恢复上次位置，不是用户在往下滑，别误判成"读到底了"
+    if (reader._restoring) { lastTop = sc.scrollTop; return; }
+    // 换章后的第一次滚动不判断方向
+    if (reader.chapterIndex !== lastChapter) { lastChapter = reader.chapterIndex; lastTop = sc.scrollTop; return; }
     const max = sc.scrollHeight - sc.clientHeight;
     if (max <= 0) return;
     const bottomGap = max - sc.scrollTop;

@@ -191,6 +191,8 @@ const app = {
     const m = /^#\/read\/(.+)$/.exec(location.hash || '');
     if (m) {
       const b = this.books.find(x => x.id === m[1]);
+      // 已经在这本书的阅读页里（openBook 自己改 hash 会再触发一次 route），不要重开
+      if (b && this.curBookId === b.id && $('page-reader').classList.contains('active')) return;
       if (b) this.openBook(b);
       else { location.hash = ''; this.showPage('library'); }
     } else {
