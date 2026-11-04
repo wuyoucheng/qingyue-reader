@@ -397,35 +397,65 @@ const app = {
     if (!b) return;
     this.openSheet('sheet-catalog');
     $('catalog-search').value = '';
+    this._catQ = '';
     db.getTitles(b.id).then(titles => {
-      $('catalog-count').textContent = titles.length + ' 章';
-      const list = $('catalog-list');
-      list.innerHTML = '';
-      const frag = document.createDocumentFragment();
-      for (const t of titles) {
-        const d = document.createElement('div');
-        d.className = 'cat-item' + (t.index === reader.chapterIndex ? ' cur' : '');
-        d.dataset.idx = t.index;
-        d.innerHTML = `<span class="cat-idx">${t.index + 1}</span><span class="cat-t">${escapeHtml(t.title)}</span>`;
-        d.addEventListener('click', () => {
-          reader.loadChapter(t.index, { toTop: true });
-          this.closeSheets();
-        });
-        frag.appendChild(d);
-      }
-      list.appendChild(frag);
-      const cur = list.querySelector('.cat-item.cur');
-      if (cur) cur.scrollIntoView({ block: 'center' });
+      this._catTitles = titles;
+      this.renderCatalog(true);
     });
+  },
+
+  /** 渲染目录列表。desc=true 时按「最新章节在上」倒序。 */
+  renderCatalog(centerCur) {
+    const titles = this._catTitles || [];
+    const desc = !!settings.catalogDesc;
+    const btn = $('catalog-sort');
+    btn.querySelector('span').textContent = desc ? '倒序' : '正序';
+    btn.classList.toggle('on', desc);
+    $('catalog-count').textContent = titles.length + ' 章';
+
+    const list = $('catalog-list');
+    list.innerHTML = '';
+    const frag = document.createDocumentFragment();
+    const rows = desc ? titles.slice().reverse() : titles;
+    const q = (this._catQ || '').toLowerCase();
+    for (const t of rows) {
+      const d = document.createElement('div');
+      d.className = 'cat-item' + (t.index === reader.chapterIndex ? ' cur' : '');
+      if (q && !(t.title || '').toLowerCase().includes(q)) d.classList.add('hide');
+      d.dataset.idx = t.index;
+      d.innerHTML = `<span class="cat-idx">${t.index + 1}</span><span class="cat-t">${escapeHtml(t.title)}</span>`;
+      d.addEventListener('click', () => {
+        reader.loadChapter(t.index, { toTop: true });
+        this.closeSheets();
+      });
+      frag.appendChild(d);
+    }
+    list.appendChild(frag);
+
+    const cur = list.querySelector('.cat-item.cur');
+    if (centerCur) {
+      // 打开时定位到当前章（倒序时可能在列表顶部附近，也不冲突）
+      if (cur) cur.scrollIntoView({ block: 'center' });
+      else list.scrollTop = 0;
+    } else {
+      list.scrollTop = 0;
+    }
+  },
+
+  toggleCatalogSort() {
+    saveSettings({ catalogDesc: !settings.catalogDesc });
+    this.renderCatalog(false);
   },
 
   bindCatalog() {
     $('catalog-search').addEventListener('input', e => {
       const q = e.target.value.trim().toLowerCase();
+      this._catQ = q;
       document.querySelectorAll('.cat-item').forEach(el => {
         el.classList.toggle('hide', !!q && !el.textContent.toLowerCase().includes(q));
       });
     });
+    $('catalog-sort').addEventListener('click', () => this.toggleCatalogSort());
   },
 
   /* ================= 设置 ================= */
@@ -693,6 +723,7 @@ const app = {
       if (!b) return;
       await db.patchBook(b.id, { progress: { chapterIndex: 0, blockIndex: 0, ratio: 0, percent: 0 } });
       Object.assign(b, { progress: { chapterIndex: 0, blockIndex: 0, ratio: 0, percent: 0 } });
+      reader.clearPos(b.id);
       this.closeSheets();
       this.openBook(b);
     });
