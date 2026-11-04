@@ -17,6 +17,7 @@ export const DEFAULTS = {
   ttsVoice: '',
   timerMin: 0,
   sortBy: 'recent',       // recent | title | added
+  catalogDesc: false,     // 目录是否倒序（最新章节在上）
 };
 
 function load() {
