@@ -96,9 +96,56 @@ export const reader = {
     // 退出/切后台/被系统杀掉前都存一次
     document.addEventListener('visibilitychange', () => {
       if (document.hidden) this.saveProgress(true);
+      else this.retryRestore();          // 页面真正可见后，若还没回到位就再补一次
     });
     window.addEventListener('pagehide', () => this.saveProgress(true));
     window.addEventListener('beforeunload', () => this.saveProgress(true));
+    window.addEventListener('pageshow', () => this.retryRestore());
+
+    // 连点章节标题 3 次 → 阅读位置诊断（真机排查用）
+    let taps = 0, tapT = 0;
+    this.el.title.addEventListener('click', () => {
+      const now = Date.now();
+      taps = now - tapT < 900 ? taps + 1 : 1;
+      tapT = now;
+      if (taps >= 3) { taps = 0; this.showDiag(); }
+    });
+  },
+
+  /* ---------------- 位置持久化（双写：IndexedDB + localStorage） ---------------- */
+  posKey() { return 'nr.pos.' + (this.book ? this.book.id : ''); },
+
+  savePosLocal(p) {
+    try {
+      localStorage.setItem(this.posKey(), JSON.stringify({
+        chapterIndex: p.chapterIndex, blockIndex: p.blockIndex,
+        ratio: p.ratio, percent: p.percent, ts: Date.now(),
+      }));
+    } catch (e) {}
+  },
+
+  /** 取较新的那份：localStorage 比数据库新（数据库写失败时）就用它 */
+  readPos(book) {
+    const p = (book && book.progress) || {};
+    const dbTs = (book && book.lastReadAt) || 0;
+    let ls = null;
+    try { ls = JSON.parse(localStorage.getItem('nr.pos.' + book.id) || 'null'); } catch (e) {}
+    if (ls && ls.ts > dbTs + 500) {
+      this._diagPush('用本地备份位置 ts=' + ls.ts + ' > 库 ' + dbTs);
+      return ls;
+    }
+    return p;
+  },
+
+  _diagPush(s) {
+    this._diag = this._diag || [];
+    this._diag.push(s);
+    if (this._diag.length > 12) this._diag.shift();
+  },
+
+  /** 手动重置进度/重新解析时，本地备份也要一起清掉 */
+  clearPos(id) {
+    try { localStorage.removeItem('nr.pos.' + id); } catch (e) {}
   },
 
   /* ---------------- 打开书籍 ---------------- */
@@ -112,7 +159,7 @@ export const reader = {
 
     this.el.bookName.textContent = book.title;
     this.applyStyle();
-    const p = book.progress || {};
+    const p = this.readPos(book);
     const idx = Math.min(Math.max(0, p.chapterIndex || 0), this.titles.length - 1);
     await this.loadChapter(idx, { block: p.blockIndex || 0, ratio: p.ratio || 0, restore: true });
     return true;
@@ -197,6 +244,8 @@ export const reader = {
     const wantRatio = opt.ratio > 0 ? opt.ratio : 0;
     const needRestore = wantBlock > 0 || wantRatio > 0.02 || opt.restore;
     this._want = needRestore ? { block: wantBlock, ratio: wantRatio } : null;
+    this._restoreTries = 0;
+    this._restoreDone = false;
 
     if (needRestore) this.restoreTo(wantBlock, wantRatio);
     else requestAnimationFrame(() => { requestAnimationFrame(() => this.afterRender()); });
@@ -209,8 +258,9 @@ export const reader = {
 
   /**
    * 回到上次位置。
-   * 真机上章节内容长、字体/布局可能还没稳定，一次 scrollTop 赋值会被夹回 0，
-   * 所以这里按「先抢一次，再逐步重试」的方式做，并且用比例兜底。
+   * 真机上章节内容长、字体/布局可能还没稳定，一次 scrollTop 赋值会被夹回 0；
+   * 部分安卓 WebView 甚至会忽略程序化 scrollTop。所以：
+   *   1) 分多轮重试；2) 赋值不生效时让浏览器自己 scrollIntoView；3) 用比例兜底。
    */
   async restoreTo(block, ratio) {
     const sc = this.el.scroll;
@@ -221,14 +271,14 @@ export const reader = {
 
     for (let k = 0; k < delays.length && !ok; k++) {
       if (delays[k]) await new Promise(r => setTimeout(r, delays[k]));
-      if (this._userScrolled) break;      // 用户已经开始读了，不再动
+      if (this._userScrolled) { this._diagPush('k' + k + ' 用户已滚动，放弃'); break; }
       if (k === 3 && document.fonts && document.fonts.ready) {
         try { await document.fonts.ready; } catch (e) {}
       }
 
       if (pm) {
         this.measurePages(true);
-        if (this.pages <= 1) continue;      // 还没测量出页数，等下一轮
+        if (this.pages <= 1) { this._diagPush('k' + k + ' 页数未测出'); continue; }
         const el = block > 0 ? this.spans[block] : null;
         let p = el ? Math.round(el.offsetLeft / (this.step || 1)) : 0;
         // offsetLeft 在多列布局里不一定可靠，block 定位失败就用比例
@@ -238,10 +288,11 @@ export const reader = {
         this.el.content.style.transition = 'none';
         this.el.content.style.transform = `translateX(${-p * this.step}px)`;
         ok = p > 0;
+        this._diagPush('k' + k + ' 翻页 p=' + p + '/' + this.pages);
         if (ok) requestAnimationFrame(() => { this.el.content.style.transition = ''; });
       } else {
         const max = sc.scrollHeight - sc.clientHeight;
-        if (max <= 0) continue;                        // 版面还没出来，继续等
+        if (max <= 0) { this._diagPush('k' + k + ' 高度未就绪'); continue; }
         const el = block > 0 ? this.spans[block] : null;
         let y = 0;
         if (el) {
@@ -252,15 +303,69 @@ export const reader = {
         }
         y = Math.max(0, Math.min(max, Math.round(y)));
         sc.scrollTop = y;
-        // 赋值被夹回 0（版面未就绪）或已经到位，都算这一轮结束
-        ok = y === 0 || Math.abs(sc.scrollTop - y) <= 24;
-        if (!ok) sc.scrollTop = y;
+        let got = sc.scrollTop;
+        if (Math.abs(got - y) > 24) {
+          // scrollTop 被忽略：让浏览器自己把目标元素滚到顶部
+          if (el) {
+            try { el.scrollIntoView({ block: 'start' }); } catch (e) { try { el.scrollIntoView(true); } catch (e2) {} }
+            if (sc.scrollTop > 8) sc.scrollTop -= 8;
+          } else {
+            sc.scrollTop = y;
+          }
+          got = sc.scrollTop;
+        }
+        this._diagPush('k' + k + ' 目标=' + y + ' 实到=' + got + ' max=' + Math.round(max));
+        ok = y === 0 || Math.abs(got - y) <= 48;
       }
     }
 
     this._restoring = false;
     this._userScrolled = false;
+    this._restoreDone = ok;
+    this._diagPush('恢复' + (ok ? '成功' : '失败') + ' 目标block=' + block + ' ratio=' + (ratio || 0).toFixed(3));
     this.afterRender();
+
+    // 兜底：过 800ms 还没到位，再补一次（真机布局可能更慢）
+    if (!ok && (this._restoreTries || 0) < 2) {
+      this._restoreTries = (this._restoreTries || 0) + 1;
+      setTimeout(() => {
+        if (!this._restoreDone && !this._userScrolled) this.restoreTo(block, ratio);
+      }, 800);
+    }
+  },
+
+  /** 页面重新可见时，若上次没回到位就再补一次 */
+  retryRestore() {
+    if (!this._want || this._restoreDone || this._userScrolled) return;
+    if ((this._restoreTries || 0) >= 2) return;
+    this._restoreTries = (this._restoreTries || 0) + 1;
+    this._diagPush('可见后补一次：' + this._restoreTries);
+    this.restoreTo(this._want.block, this._want.ratio);
+  },
+
+  /** 连点章节标题 3 次触发：把位置相关的数据摊开，方便截图排查 */
+  async showDiag() {
+    let saved = '读取失败';
+    try {
+      const b = await db.getBook(this.book.id);
+      saved = JSON.stringify(b && b.progress);
+    } catch (e) { saved = 'err ' + e.message; }
+    let ls = '无';
+    try { ls = localStorage.getItem(this.posKey()) || '无'; } catch (e) {}
+    const sc = this.el.scroll;
+    const lines = [
+      '【阅读位置诊断 v1.24】',
+      '书: ' + (this.book ? this.book.title : '-'),
+      '当前: 第' + (this.chapterIndex + 1) + '章 block=' + this.currentBlock(),
+      '滚动: top=' + Math.round(sc.scrollTop) + ' / max=' + Math.round(sc.scrollHeight - sc.clientHeight),
+      '屏高=' + sc.clientHeight + ' 屏宽=' + sc.clientWidth + ' 模式=' + settings.scrollMode,
+      '听书: playing=' + (this.speaker && this.speaker.playing) + ' 读到句=' + (this._ttsBlock == null ? '-' : this._ttsBlock),
+      '库里存的: ' + saved,
+      '本地备份: ' + ls,
+    ].concat(this._diag || ['（无可重试）']);
+    const txt = lines.join('\n');
+    try { alert(txt); } catch (e) { this.toast(txt.slice(0, 90)); }
+    if (this.onToast) this.onToast('诊断已弹出，可截图');
   },
 
   afterRender() {
@@ -354,8 +459,13 @@ export const reader = {
     if (!this.book || !this.chapter) return;
     // 正在回位的过程中不要存，否则会把刚恢复的位置写回 0
     if (this._restoring && !force) return;
-    const ratio = this.currentRatio();
-    const block = this.currentBlock();
+    let ratio = this.currentRatio();
+    let block = this.currentBlock();
+    // 听书时屏幕是黑的，滚动位置不跟着走；这种情况用朗读到的那句做位置
+    if (document.hidden && this.speaker && this.speaker.playing && this._ttsBlock > 0) {
+      block = this._ttsBlock;
+      ratio = this.spans.length > 1 ? block / (this.spans.length - 1) : ratio;
+    }
     const before = this.charsBefore[this.chapterIndex] || 0;
     const len = this.chapter.len || this.chapter.text.length || 0;
     const read = before + Math.round(len * ratio);
@@ -371,7 +481,8 @@ export const reader = {
       lastReadAt: Date.now(),
     };
     Object.assign(this.book, patch);
-    try { await db.patchBook(this.book.id, patch); } catch (e) {}
+    this.savePosLocal(patch.progress);          // 先写本地备份，数据库失败也不丢
+    try { await db.patchBook(this.book.id, patch); } catch (e) { this._diagPush('写库失败 ' + (e.message || e)); }
     this.updateProgressBar();
   },
 
@@ -385,6 +496,7 @@ export const reader = {
 
   /* ---------------- 朗读高亮 ---------------- */
   highlight(i) {
+    if (i >= 0) this._ttsBlock = i;          // 记住朗读到哪一句，后台/不可见时也能存进度
     this.el.text.querySelectorAll('.sent.speaking').forEach(n => n.classList.remove('speaking'));
     if (i < 0 || !this.spans[i]) return;
     const el = this.spans[i];
@@ -461,6 +573,7 @@ export const reader = {
       encoding: parsed.encoding || encoding,
       progress: { chapterIndex: 0, blockIndex: 0, ratio: 0, percent: 0 },
     });
+    this.clearPos(bookId);
     return parsed;
   },
 };
