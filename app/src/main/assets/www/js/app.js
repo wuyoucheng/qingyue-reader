@@ -379,8 +379,8 @@ const app = {
       const next = order[(order.indexOf(settings.theme) + 1) % order.length];
       this.setTheme(next);
     });
-    $('btn-next-chap').addEventListener('click', () => reader.loadChapter(reader.chapterIndex + 1, { toTop: true }));
-    $('btn-prev-chap').addEventListener('click', () => reader.loadChapter(reader.chapterIndex - 1, { toTop: true }));
+    $('btn-next-chap').addEventListener('click', () => { reader.noteUserNav(); reader.loadChapter(reader.chapterIndex + 1, { toTop: true }); });
+    $('btn-prev-chap').addEventListener('click', () => { reader.noteUserNav(); reader.loadChapter(reader.chapterIndex - 1, { toTop: true }); });
   },
 
   setTheme(t) {
@@ -425,6 +425,7 @@ const app = {
       d.dataset.idx = t.index;
       d.innerHTML = `<span class="cat-idx">${t.index + 1}</span><span class="cat-t">${escapeHtml(t.title)}</span>`;
       d.addEventListener('click', () => {
+        reader.noteUserNav();
         reader.loadChapter(t.index, { toTop: true });
         this.closeSheets();
       });

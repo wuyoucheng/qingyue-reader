@@ -117,11 +117,26 @@ export class Speaker {
   }
 
   /** 回到前台时与原生状态对齐（后台期间网页被冻结，进度回调可能丢失） */
+  /**
+   * 原生队列的真实位置。
+   * 网页被系统冻结/重载期间，朗读在原生侧继续跨章推进，
+   * 这时原生状态是唯一可信的位置来源（网页里的 chapterIndex 是旧的）。
+   */
+  nativeState() {
+    if (!this.queueMode || !this.native) return null;
+    try {
+      const s = JSON.parse(this.native.queueState() || '{}');
+      if (!s || typeof s.playing !== 'boolean') return null;
+      if (typeof s.chapter !== 'number' || s.chapter < 0) return null;
+      return s;
+    } catch (e) { return null; }
+  }
+
   syncFromNative() {
     if (!this.queueMode || !this.native) return;
     try {
-      const s = JSON.parse(this.native.queueState() || '{}');
-      if (!s || typeof s.playing !== 'boolean') return;
+      const s = this.nativeState();
+      if (!s) return;
       if (s.chapter >= 0 && s.chapter !== this.chapter) {
         this.chapter = s.chapter;
         try { this.hooks.onRemoteChapter(s.chapter, s.title || ''); } catch (e) {}
@@ -243,6 +258,8 @@ export class Speaker {
       this.native.setRate(o.rate || 1);
       this.native.setPitch(o.pitch || 1);
       if (o.voiceURI) this.native.setVoice(o.voiceURI);
+      // 告诉原生是哪本书，它才能把朗读进度落盘（网页被冻结后靠它找回位置）
+      if (this.native.setBookId && meta.bookId) this.native.setBookId(meta.bookId);
     } catch (e) { /* ignore */ }
 
     let payload = '';
