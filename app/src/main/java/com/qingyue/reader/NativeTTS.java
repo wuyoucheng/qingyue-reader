@@ -56,7 +56,76 @@ public class NativeTTS {
     private volatile boolean builtinReady = false;
     private volatile String builtinErr = "";   // 内置引擎初始化失败原因（诊断用）
     private static final String BUILTIN_NAME = "小燕 · 离线女声";
-    private static final String APP_VER = "v1.25";
+    private static final String APP_VER = "v1.26";
+
+    /* ---------------- 朗读进度落盘 ----------------
+     * 后台连播时网页被系统冻结，它没法保存进度；App 被划掉/被杀时网页更没机会保存。
+     * 所以原生这边每次推进都写一份「书 + 章 + 句」到 SharedPreferences，
+     * 下次进阅读页时网页可以取回这份位置（比库里的新就用它）。
+     */
+    private String qBookId = "";
+    private long posSavedAt = 0;
+    private int posSavedChapter = -1, posSavedIndex = -1;
+
+    private android.content.SharedPreferences posPrefs() {
+        return appContext.getSharedPreferences("qingyue_pos", Context.MODE_PRIVATE);
+    }
+
+    private void saveQueuePos(boolean force) {
+        try {
+            if (qBookId == null || qBookId.isEmpty()) return;
+            long now = System.currentTimeMillis();
+            if (!force && qChapter == posSavedChapter && qIndex == posSavedIndex) return;
+            if (!force && now - posSavedAt < 8000) return;
+            if (qChapter < 0) return;
+            posPrefs().edit()
+                    .putString("book", qBookId)
+                    .putInt("chapter", qChapter)
+                    .putInt("index", qIndex)
+                    .putInt("total", queue.size())
+                    .putString("title", qTitle == null ? "" : qTitle)
+                    .putLong("ts", now)
+                    .apply();
+            posSavedAt = now;
+            posSavedChapter = qChapter;
+            posSavedIndex = qIndex;
+        } catch (Throwable ignore) { }
+    }
+
+    /** 网页在开播前告知是哪本书，进度才知道该记给谁 */
+    @JavascriptInterface
+    public void setBookId(String id) {
+        qBookId = id == null ? "" : id;
+    }
+
+    /** 网页重置进度 / 重新分章时清掉，免得下次又被旧位置顶回去 */
+    @JavascriptInterface
+    public void clearLastPos() {
+        try { posPrefs().edit().clear().apply(); } catch (Throwable ignore) { }
+        posSavedAt = 0;
+        posSavedChapter = -1;
+        posSavedIndex = -1;
+    }
+
+    /** 上一次朗读落盘的位置（网页被冻结/App 被杀后用它找回位置） */
+    @JavascriptInterface
+    public String lastPos() {
+        try {
+            android.content.SharedPreferences p = posPrefs();
+            long ts = p.getLong("ts", 0);
+            if (ts <= 0) return "{}";
+            JSONObject o = new JSONObject();
+            o.put("book", p.getString("book", ""));
+            o.put("chapter", p.getInt("chapter", 0));
+            o.put("index", p.getInt("index", 0));
+            o.put("total", p.getInt("total", 0));
+            o.put("title", p.getString("title", ""));
+            o.put("ts", ts);
+            return o.toString();
+        } catch (Throwable t) {
+            return "{}";
+        }
+    }
 
     /* 在线音色：微软 Edge TTS（免费、无需 key；纯 Java 实现，不碰 native） */
     private EdgeTtsEngine edge;
@@ -907,6 +976,7 @@ public class NativeTTS {
         qIndex = Math.max(0, Math.min(startIndex, queue.size() - 1));
         qPlaying = true;
         qPaused = false;
+        saveQueuePos(true);
         qErrStreak = 0;
         qLastNotified = -1;
         qNeedWait = 0;
@@ -947,6 +1017,7 @@ public class NativeTTS {
         qIndex = 0;
         qErrStreak = 0;
         qLastNotified = -1;
+        saveQueuePos(true);           // 跨章立刻落盘：这一步最容易丢进度
         Log.i(TAG, "-> ch" + qChapter + " " + qTitle + " (" + queue.size() + " 句)");
         notifyProgress(true);
         playAt(0);
@@ -967,6 +1038,7 @@ public class NativeTTS {
         final int token = ++qToken;
         final String text = queue.get(i);
         qIndex = i;
+        saveQueuePos(false);          // 后台/被杀也留个位置（有节流，不会频繁写盘）
         notifyProgress(true);
 
         if (text == null || text.trim().isEmpty()) {
