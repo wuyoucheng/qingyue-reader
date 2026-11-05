@@ -48,6 +48,7 @@ export const reader = {
       getSentences: () => this.sentences,
       getMeta: () => ({
         book: this.book ? this.book.title : '',
+        bookId: this.book ? this.book.id : '',
         chapter: this.titles[this.chapterIndex] ? this.titles[this.chapterIndex].title : '',
         chapterIndex: this.chapterIndex,
       }),
@@ -85,7 +86,7 @@ export const reader = {
     }, { passive: true });
 
     // 用户自己动手了就放弃自动定位，避免"回位"跟用户抢滚动条
-    const markUser = () => { if (!this._restoring) this._userScrolled = true; };
+    const markUser = () => { this._userScrolled = true; };
     ['touchstart', 'wheel', 'mousedown', 'keydown'].forEach(ev =>
       this.el.scroll.addEventListener(ev, markUser, { passive: true }));
 
@@ -130,6 +131,12 @@ export const reader = {
     const dbTs = (book && book.lastReadAt) || 0;
     let ls = null;
     try { ls = JSON.parse(localStorage.getItem('nr.pos.' + book.id) || 'null'); } catch (e) {}
+    // 数据库被写成「第1章开头」但本地备份还留着真实位置：备份优先（重置进度时会 clearPos，不会误伤）
+    const dbZero = !p.chapterIndex && !p.blockIndex && !(p.ratio > 0.02);
+    if (ls && ls.chapterIndex > 0 && dbZero) {
+      this._diagPush('库里是 0,0,0，用本地备份 第' + (ls.chapterIndex + 1) + '章');
+      return ls;
+    }
     if (ls && ls.ts > dbTs + 500) {
       this._diagPush('用本地备份位置 ts=' + ls.ts + ' > 库 ' + dbTs);
       return ls;
@@ -146,6 +153,12 @@ export const reader = {
   /** 手动重置进度/重新解析时，本地备份也要一起清掉 */
   clearPos(id) {
     try { localStorage.removeItem('nr.pos.' + id); } catch (e) {}
+    // 原生那边落盘的朗读位置同样作废，否则下次又被旧位置顶回去
+    try {
+      const n = this.speaker && this.speaker.native;
+      if (n && n.clearLastPos) n.clearLastPos();
+    } catch (e) {}
+    this._baseChapter = 0;
   },
 
   /* ---------------- 打开书籍 ---------------- */
@@ -160,8 +173,47 @@ export const reader = {
     this.el.bookName.textContent = book.title;
     this.applyStyle();
     const p = this.readPos(book);
-    const idx = Math.min(Math.max(0, p.chapterIndex || 0), this.titles.length - 1);
-    await this.loadChapter(idx, { block: p.blockIndex || 0, ratio: p.ratio || 0, restore: true });
+    let idx = Math.min(Math.max(0, p.chapterIndex || 0), this.titles.length - 1);
+    let rblock = p.blockIndex || 0;
+    let rratio = p.ratio || 0;
+    this._baseChapter = idx;
+
+    // 原生队列还活着（App 重进、或网页被系统重载但朗读没停）：
+    // 这时朗读进度才是真的，网页里存的那份是冻结前的旧位置。
+    const ns = this.speaker && this.speaker.nativeState ? this.speaker.nativeState() : null;
+    const live = ns && (ns.playing || ns.paused)
+      && ns.chapter >= 0 && ns.chapter < this.titles.length
+      && (ns.chapter > idx || (ns.chapter === idx && (ns.index || 0) > rblock));
+    if (live) {
+      idx = ns.chapter;
+      rblock = ns.index || 0;
+      rratio = ns.total > 0 ? Math.min(0.999, rblock / ns.total) : 0;
+      this._diagPush('用原生朗读位置：第' + (ns.chapter + 1) + '章 ' + (rblock + 1) + '/' + ns.total);
+    } else {
+      // 队列已经停了（App 被杀过）：原生上次落盘的位置也可能比库里的新
+      const lp = this.lastNativePos(book.id);
+      if (lp && lp.chapter > idx && lp.chapter < this.titles.length) {
+        idx = lp.chapter;
+        rblock = lp.index || 0;
+        rratio = lp.total > 0 ? Math.min(0.999, rblock / lp.total) : 0;
+        this._diagPush('用原生落盘位置：第' + (lp.chapter + 1) + '章 ' + (rblock + 1) + '/' + lp.total);
+      }
+    }
+
+    await this.loadChapter(idx, { block: rblock, ratio: rratio, restore: true });
+
+    if (live) {
+      // 把高亮和播放状态接上，避免页面显示第一句而声音在读别处
+      this._ttsBlock = rblock;
+      this.speaker.chapter = ns.chapter;
+      this.speaker.index = rblock;
+      this.speaker.total = ns.total || 0;
+      this.speaker.playing = true;
+      this.speaker.paused = !!ns.paused;
+      this.speaker.sentences = this.sentences;
+      this.highlight(rblock);
+      this.speaker.emit();
+    }
     return true;
   },
 
@@ -352,16 +404,21 @@ export const reader = {
     } catch (e) { saved = 'err ' + e.message; }
     let ls = '无';
     try { ls = localStorage.getItem(this.posKey()) || '无'; } catch (e) {}
+    const ns = this.speaker && this.speaker.nativeState ? this.speaker.nativeState() : null;
+    let wlog = [];
+    try { wlog = JSON.parse(localStorage.getItem('nr.wlog') || '[]'); } catch (e) {}
     const sc = this.el.scroll;
     const lines = [
-      '【阅读位置诊断 v1.24】',
+      '【阅读位置诊断 v1.26】',
       '书: ' + (this.book ? this.book.title : '-'),
       '当前: 第' + (this.chapterIndex + 1) + '章 block=' + this.currentBlock(),
       '滚动: top=' + Math.round(sc.scrollTop) + ' / max=' + Math.round(sc.scrollHeight - sc.clientHeight),
       '屏高=' + sc.clientHeight + ' 屏宽=' + sc.clientWidth + ' 模式=' + settings.scrollMode,
       '听书: playing=' + (this.speaker && this.speaker.playing) + ' 读到句=' + (this._ttsBlock == null ? '-' : this._ttsBlock),
+      '原生: ' + (ns ? ('第' + (ns.chapter + 1) + '章 ' + ((ns.index || 0) + 1) + '/' + ns.total + ' playing=' + ns.playing + ' paused=' + ns.paused) : '无'),
       '库里存的: ' + saved,
       '本地备份: ' + ls,
+      '写进度流水(时间|章|块|来源): ' + (wlog.length ? wlog.slice(-6).join('  ') : '空'),
     ].concat(this._diag || ['（无可重试）']);
     const txt = lines.join('\n');
     try { alert(txt); } catch (e) { this.toast(txt.slice(0, 90)); }
@@ -459,31 +516,88 @@ export const reader = {
     if (!this.book || !this.chapter) return;
     // 正在回位的过程中不要存，否则会把刚恢复的位置写回 0
     if (this._restoring && !force) return;
+
     let ratio = this.currentRatio();
     let block = this.currentBlock();
-    // 听书时屏幕是黑的，滚动位置不跟着走；这种情况用朗读到的那句做位置
-    if (document.hidden && this.speaker && this.speaker.playing && this._ttsBlock > 0) {
+    let chIdx = this.chapterIndex;
+    let src = 'web';
+
+    // 回位没做完就被要求存（切后台/退出）：存「目标位置」，别存半成品
+    if (this._restoring && this._want) {
+      block = this._want.block || block;
+      ratio = this._want.ratio || ratio;
+      src = 'restoring->want';
+    }
+
+    // 原生队列才是真位置：后台连播会自己跨章，网页这边还冻在老章上
+    const ns = this.speaker && this.speaker.nativeState ? this.speaker.nativeState() : null;
+    if (ns && (ns.playing || ns.paused) && ns.chapter >= 0 && ns.chapter < this.titles.length) {
+      const nIdx = ns.index || 0;
+      if (ns.chapter !== chIdx || nIdx !== block) src = 'native';
+      chIdx = ns.chapter;
+      block = nIdx;
+      ratio = ns.total > 0 ? Math.min(0.999, nIdx / ns.total) : 0;
+      this._ttsBlock = nIdx;
+    } else if (document.hidden && this.speaker && this.speaker.playing && this._ttsBlock > 0) {
+      // 浏览器语音（无原生队列）时，用朗读到的那句做位置
       block = this._ttsBlock;
       ratio = this.spans.length > 1 ? block / (this.spans.length - 1) : ratio;
+      src = 'speech';
     }
-    const before = this.charsBefore[this.chapterIndex] || 0;
-    const len = this.chapter.len || this.chapter.text.length || 0;
+
+    // 防回退：绝不用「第 1 章第 0 句」覆盖已有进度（这是位置丢失的典型痕迹）
+    // 除非用户刚刚自己主动跳章（目录/上一章/下一章），那种情况要照实存
+    const userJustJumped = this._userNavAt && Date.now() - this._userNavAt < 60000;
+    if (chIdx === 0 && block === 0 && ratio < 0.01 && (this._baseChapter || 0) > 0 && !userJustJumped) {
+      this._diagPush('拦截：拒绝把进度改回第1章开头（原第' + (this._baseChapter + 1) + '章）');
+      this._wlog(0, 0, 'blocked');
+      return;
+    }
+
+    const before = this.charsBefore[chIdx] || 0;
+    const len = (chIdx === this.chapterIndex && this.chapter.len)
+      || (this.titles[chIdx] && this.titles[chIdx].len) || 0;
     const read = before + Math.round(len * ratio);
     const total = this.book.chars || this.charsBefore[this.charsBefore.length - 1] || 1;
     const pct = Math.max(0, Math.min(99.9, read / total * 100));
     const patch = {
-      progress: {
-        chapterIndex: this.chapterIndex,
-        blockIndex: block,
-        ratio,
-        percent: pct,
-      },
+      progress: { chapterIndex: chIdx, blockIndex: block, ratio, percent: pct },
       lastReadAt: Date.now(),
     };
+    this._baseChapter = chIdx;
     Object.assign(this.book, patch);
     this.savePosLocal(patch.progress);          // 先写本地备份，数据库失败也不丢
+    this._wlog(chIdx, block, src);
     try { await db.patchBook(this.book.id, patch); } catch (e) { this._diagPush('写库失败 ' + (e.message || e)); }
     this.updateProgressBar();
+  },
+
+  /** 原生上次落盘的朗读位置（队列已停也能取到；不是这本书或太旧就返回 null） */
+  lastNativePos(bookId) {
+    try {
+      const n = this.speaker && this.speaker.native;
+      if (!n || !n.lastPos) return null;
+      const p = JSON.parse(n.lastPos() || '{}');
+      if (!p || p.book !== bookId) return null;
+      if (!(p.chapter >= 0)) return null;
+      // 超过 30 天视为过期，避免很久以前听过的位置把现在的进度顶掉
+      if (p.ts && Date.now() - p.ts > 30 * 86400000) return null;
+      return p;
+    } catch (e) { return null; }
+  },
+
+  /** 用户主动跳章（目录、上一章/下一章）：短时间内允许进度“往回跳” */
+  noteUserNav() { this._userNavAt = Date.now(); },
+
+  /** 写进度流水（环形，20 条），出问题时能看出是哪一步把位置写坏的 */
+  _wlog(chIdx, block, src) {
+    try {
+      const k = 'nr.wlog';
+      const arr = JSON.parse(localStorage.getItem(k) || '[]');
+      arr.push([Date.now() % 1000000, chIdx + 1, block, src].join('|'));
+      while (arr.length > 20) arr.shift();
+      localStorage.setItem(k, JSON.stringify(arr));
+    } catch (e) {}
   },
 
   updateProgressBar() {
@@ -574,6 +688,7 @@ export const reader = {
       progress: { chapterIndex: 0, blockIndex: 0, ratio: 0, percent: 0 },
     });
     this.clearPos(bookId);
+    this._baseChapter = 0;    // 重新分章后章节号全变了，防回退基准重置
     return parsed;
   },
 };
