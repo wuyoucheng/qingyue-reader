@@ -89,6 +89,20 @@ public class EdgeTtsEngine {
     private volatile WebSocket ws;
     private volatile MediaPlayer player;
     private volatile int playerGen = -1;
+
+    /* ---- 句间无缝接续（v1.29）----
+     * 逐句播放时，每句都要 new MediaPlayer → setDataSource → prepare → start，
+     * 本地 mp3 的 prepare 也要几十到两百毫秒，加上把上一句 stop/release 的时间，
+     * 听感就是每句之间「顿一下」。预合成只解决了「等网络合成」，解决不了这一段。
+     * 这里在当前句播放时就把它后面那句 prepare 好放进 nxt，播完直接 start，
+     * 中间的 gap 从 200~400ms 降到几十毫秒。
+     */
+    private volatile MediaPlayer nxt;
+    private volatile File nxtFile;
+    private volatile String nxtKey = "";
+    private volatile int nxtGen = -1;
+    private volatile boolean seamless = true;
+
     private volatile boolean stopRequested = false;
     private volatile String lastError = "";
 
@@ -231,25 +245,67 @@ public class EdgeTtsEngine {
         inflight.clear();
         for (File f : ready.values()) deleteQuiet(f);
         ready.clear();
+        main.post(this::releaseNxt);
     }
 
     /* ===================== 合成与播放 ===================== */
 
+    /** 一次朗读任务：当前句 + 可选的「下一句」（提前 prepare 好，无缝接上） */
+    private final class Job {
+        final String text, next, voice;
+        final float rate;
+        final Callback cb;
+        final int my;
+        boolean nextRetried = false;
+
+        Job(String text, String next, String voice, float rate, Callback cb, int my) {
+            this.text = text;
+            this.next = next;
+            this.voice = voice;
+            this.rate = rate;
+            this.cb = cb;
+            this.my = my;
+        }
+    }
+
+    /** 开关：句间无缝接续（关掉就退回每句完整新建播放器的老路径） */
+    public void setSeamless(boolean on) {
+        seamless = on;
+        if (!on) main.post(this::releaseNxt);
+    }
+
+    public boolean isSeamless() {
+        return seamless;
+    }
+
     /** 合成并朗读一句；voice 传空用晓晓 */
     public void speak(String text, String voice, float rate, Callback cb) {
+        speak(text, null, voice, rate, cb);
+    }
+
+    /**
+     * 合成并朗读一句，同时把 nextText 那句提前 prepare 好，播完直接接上。
+     * 下一句必须已经预合成（命中缓存）才会预热，否则不占用网络，行为等同单句。
+     */
+    public void speak(String text, String nextText, String voice, float rate, Callback cb) {
         final int my = seq.incrementAndGet();
         stopRequested = false;
         lastError = "";
         final String clean = text == null ? "" : text.trim();
         if (clean.isEmpty()) { cb.onResult(true); return; }
 
-        // 命中预合成缓存：直接开播，省掉整轮「建连 → 合成 → 落盘」
-        File hit = takeReady(clean, voice, rate);
-        if (hit != null) {
-            playFile(hit, cb, my);
+        final Job j = new Job(clean, nextText, voice, rate, cb, my);
+        // 上一句播放时已经把这句 prepare 好了：直接 start，省掉整段建播放器的时间
+        if (seamless && nxt != null && cacheKey(clean, voiceOf(voice), rate).equals(nxtKey)) {
+            startPrepared(j);
             return;
         }
-        connect(clean, voice, rate, cb, false, my);
+        File hit = takeReady(clean, voice, rate);
+        if (hit != null) {
+            playFile(hit, cacheKey(clean, voiceOf(voice), rate), j);
+            return;
+        }
+        connect(j, false);
     }
 
     private Request buildRequest() {
@@ -305,51 +361,47 @@ public class EdgeTtsEngine {
         out.write(arr, 2 + headerLen, arr.length - 2 - headerLen);
     }
 
-    private void connect(String text, String voice, float rate, Callback cb, boolean retried, final int my) {
+    private void connect(final Job j, boolean retried) {
         stopRequested = false;
         lastError = "";
-        final String v = voiceOf(voice);
+        final String v = voiceOf(j.voice);
         final ByteArrayOutputStream audio = new ByteArrayOutputStream();
-        final String clean = text == null ? "" : text.trim();
-        if (clean.isEmpty()) {
-            cb.onResult(true);
-            return;
-        }
+        if (j.text.isEmpty()) { j.cb.onResult(true); return; }
 
         client.newWebSocket(buildRequest(), new WebSocketListener() {
             @Override public void onOpen(WebSocket webSocket, Response response) {
-                if (my != seq.get()) { try { webSocket.close(1000, "stale"); } catch (Exception ignore) {} return; }
+                if (j.my != seq.get()) { try { webSocket.close(1000, "stale"); } catch (Exception ignore) {} return; }
                 ws = webSocket;
                 sendConfig(webSocket);
-                sendSsml(webSocket, clean, v, rate);
+                sendSsml(webSocket, j.text, v, j.rate);
             }
 
             @Override public void onMessage(WebSocket webSocket, String text) {
-                if (my != seq.get()) return;                  // 过期会话，丢弃
+                if (j.my != seq.get()) return;                  // 过期会话，丢弃
                 if (text != null && text.contains("Path:turn.end")) {
                     webSocket.close(1000, "done");
-                    playBytes(audio.toByteArray(), cb, my);
+                    playBytes(audio.toByteArray(), j);
                 }
             }
 
             @Override public void onMessage(WebSocket webSocket, okio.ByteString bytes) {
-                if (my != seq.get()) return;
+                if (j.my != seq.get()) return;
                 collectAudio(bytes, audio);
             }
 
             @Override public void onFailure(WebSocket webSocket, Throwable t, Response response) {
-                if (my != seq.get()) return;
+                if (j.my != seq.get()) return;
                 int code = response != null ? response.code() : 0;
                 // 403 常见于本机时间不准：令牌按 5 分钟窗口计算，偏差过大会被拒。
                 // 用服务端 Date 头校正后重试一次。
                 if (code == 403 && !retried && correctClock(response)) {
                     Log.w(TAG, "403, clock corrected by " + EdgeGec.getClockSkew() + "s, retry");
-                    connect(clean, v, rate, cb, true, my);
+                    connect(j, true);
                     return;
                 }
                 lastError = "EdgeTts:" + (code > 0 ? String.valueOf(code) : String.valueOf(t));
                 Log.w(TAG, "ws failure " + lastError);
-                if (!stopRequested) cb.onResult(false);
+                if (!stopRequested) j.cb.onResult(false);
             }
         });
     }
@@ -371,55 +423,61 @@ public class EdgeTtsEngine {
         }
     }
 
-    private void playBytes(byte[] mp3, Callback cb, final int my) {
-        if (my != seq.get()) return;
-        if (mp3 == null || mp3.length == 0) { cb.onResult(false); return; }
-        final File f = new File(ctx.getCacheDir(), "edge_tts_" + my + ".mp3");
+    private void playBytes(byte[] mp3, final Job j) {
+        if (j.my != seq.get()) return;
+        if (mp3 == null || mp3.length == 0) { j.cb.onResult(false); return; }
+        final File f = new File(ctx.getCacheDir(), "edge_tts_" + j.my + ".mp3");
         try {
             try (FileOutputStream out = new FileOutputStream(f)) {
                 out.write(mp3);
             }
         } catch (Throwable t) {
             lastError = "write:" + t;
-            cb.onResult(false);
+            j.cb.onResult(false);
             return;
         }
-        playFile(f, cb, my);
+        playFile(f, cacheKey(j.text, voiceOf(j.voice), j.rate), j);
+    }
+
+    private void setupPlayer(MediaPlayer p, File f) throws Exception {
+        try { p.setWakeMode(ctx, PowerManager.PARTIAL_WAKE_LOCK); } catch (Throwable ignore) { }
+        try {
+            p.setAudioAttributes(new android.media.AudioAttributes.Builder()
+                    .setUsage(android.media.AudioAttributes.USAGE_MEDIA)
+                    .setContentType(android.media.AudioAttributes.CONTENT_TYPE_SPEECH)
+                    .build());
+        } catch (Throwable ignore) { }
+        p.setDataSource(f.getAbsolutePath());
+    }
+
+    private void attachListeners(final MediaPlayer p, final File f, final Job j) {
+        p.setOnCompletionListener(mp -> {
+            if (j.my != seq.get()) return;                // 旧句播完，不要推进队列
+            releasePlayer();
+            deleteQuiet(f);
+            j.cb.onResult(true);
+        });
+        p.setOnErrorListener((mp, what, extra) -> {
+            lastError = "MediaPlayer:" + what + "/" + extra;
+            if (j.my == seq.get()) releasePlayer();
+            deleteQuiet(f);
+            if (j.my == seq.get()) j.cb.onResult(false);
+            return true;
+        });
     }
 
     /** 播放一个已落盘的 mp3（正常合成与预取缓存共用的唯一出声入口） */
-    private void playFile(final File f, final Callback cb, final int my) {
-        if (my != seq.get()) { deleteQuiet(f); return; }
+    private void playFile(final File f, final String key, final Job j) {
+        if (j.my != seq.get()) { deleteQuiet(f); return; }
         main.post(() -> {
-            if (my != seq.get()) { deleteQuiet(f); return; }   // 排队期间已被切句
+            if (j.my != seq.get()) { deleteQuiet(f); return; }   // 排队期间已被切句
             try {
                 releasePlayer();                                // 先停掉上一代，绝不允许两路同时出声
                 MediaPlayer p = new MediaPlayer();
                 player = p;
-                playerGen = my;
-                // 播放期间由 MediaPlayer 自己持 PARTIAL_WAKE_LOCK：
-                // 比服务层的 WakeLock 更贴合，锁屏后音频回调不容易被系统掐断
-                try { p.setWakeMode(ctx, PowerManager.PARTIAL_WAKE_LOCK); } catch (Throwable ignore) { }
-                try {
-                    p.setAudioAttributes(new android.media.AudioAttributes.Builder()
-                            .setUsage(android.media.AudioAttributes.USAGE_MEDIA)
-                            .setContentType(android.media.AudioAttributes.CONTENT_TYPE_SPEECH)
-                            .build());
-                } catch (Throwable ignore) { }
-                p.setDataSource(f.getAbsolutePath());
-                p.setOnCompletionListener(mp -> {
-                    if (my != seq.get()) return;                // 旧句播完，不要推进队列
-                    releasePlayer();
-                    deleteQuiet(f);
-                    cb.onResult(true);
-                });
-                p.setOnErrorListener((mp, what, extra) -> {
-                    lastError = "MediaPlayer:" + what + "/" + extra;
-                    if (my == seq.get()) releasePlayer();
-                    deleteQuiet(f);
-                    if (my == seq.get()) cb.onResult(false);
-                    return true;
-                });
+                playerGen = j.my;
+                setupPlayer(p, f);
+                attachListeners(p, f, j);
                 p.prepare();
                 p.start();
             } catch (Throwable t) {
@@ -427,9 +485,94 @@ public class EdgeTtsEngine {
                 Log.w(TAG, "play failed " + t);
                 releasePlayer();
                 deleteQuiet(f);
-                if (my == seq.get()) cb.onResult(false);
+                if (j.my == seq.get()) j.cb.onResult(false);
+                return;
             }
+            // 出声之后再去预热下一句，别拖慢起播
+            main.postDelayed(() -> prepareNext(j), 80);   // 让音频先稳住再预热，避免起播抖动
         });
+    }
+
+    /** 上一句播放时已经 prepare 好的那句：直接 start，几乎零空档 */
+    private void startPrepared(final Job j) {
+        main.post(() -> {
+            final MediaPlayer p = nxt;
+            final File pf = nxtFile;
+            nxt = null; nxtFile = null; nxtKey = ""; nxtGen = -1;
+            if (p == null) { speakFallback(j); return; }
+            if (j.my != seq.get()) { releaseOne(p); deleteQuiet(pf); return; }
+            try {
+                if (player != null) releasePlayer();   // 上一句理论上已释放，这里是兜底：绝不允许两路同时出声
+                player = p;
+                playerGen = j.my;
+                attachListeners(p, pf, j);
+                p.start();
+            } catch (Throwable t) {
+                lastError = "play2:" + t;
+                Log.w(TAG, "prepared start failed " + t);
+                releaseOne(p);
+                deleteQuiet(pf);
+                speakFallback(j);
+                return;
+            }
+            main.postDelayed(() -> prepareNext(j), 80);   // 让音频先稳住再预热，避免起播抖动
+        });
+    }
+
+    /** 预热的播放器没接上（竞态/异常）：退回正常取缓存或重新合成 */
+    private void speakFallback(final Job j) {
+        File hit = takeReady(j.text, j.voice, j.rate);
+        if (hit != null) { playFile(hit, cacheKey(j.text, voiceOf(j.voice), j.rate), j); return; }
+        connect(j, false);
+    }
+
+    /**
+     * 把下一句 prepare 好放在 nxt 里等接棒。
+     * 只吃已经预合成好的缓存：现去合成会跟当前这句抢带宽，反而更容易卡。
+     */
+    private void prepareNext(final Job j) {
+        if (!seamless) return;
+        final String nt = j.next == null ? "" : j.next.trim();
+        if (nt.isEmpty()) return;
+        final String nkey = cacheKey(nt, voiceOf(j.voice), j.rate);
+        if (nxt != null && nkey.equals(nxtKey)) return;
+        final File f = takeReady(nt, j.voice, j.rate);
+        if (f == null) {
+            // 预取可能还没落盘（刚点播放时第 2 句正在合成）：稍后再试一次
+            if (!j.nextRetried) {
+                j.nextRetried = true;
+                main.postDelayed(() -> { if (j.my == seq.get()) prepareNext(j); }, 400);
+            }
+            return;
+        }
+        MediaPlayer p = null;
+        try {
+            p = new MediaPlayer();
+            setupPlayer(p, f);
+            p.prepare();
+        } catch (Throwable t) {
+            if (p != null) { try { p.release(); } catch (Exception ignore) { } }
+            deleteQuiet(f);
+            return;
+        }
+        releaseNxt();
+        nxt = p; nxtFile = f; nxtKey = nkey; nxtGen = j.my;
+    }
+
+    private void releaseNxt() {
+        MediaPlayer p = nxt;
+        File f = nxtFile;
+        nxt = null; nxtFile = null; nxtKey = ""; nxtGen = -1;
+        if (p != null) releaseOne(p);
+        if (f != null) deleteQuiet(f);
+    }
+
+    private void releaseOne(MediaPlayer p) {
+        try {
+            try { if (p.isPlaying()) p.stop(); } catch (Exception ignore) { }
+            p.reset();
+            p.release();
+        } catch (Exception ignore) { }
     }
 
     private void releasePlayer() {
@@ -437,11 +580,7 @@ public class EdgeTtsEngine {
             MediaPlayer p = player;
             player = null;
             playerGen = -1;
-            if (p != null) {
-                try { if (p.isPlaying()) p.stop(); } catch (Exception ignore) {}
-                p.reset();
-                p.release();
-            }
+            if (p != null) releaseOne(p);
         } catch (Exception ignore) {}
     }
 
@@ -460,13 +599,14 @@ public class EdgeTtsEngine {
             // 只停掉旧代际的播放器（stop 之后立刻开新句时，新播放器不能被误停）
             if (playerGen >= 0 && playerGen < seq.get()) releasePlayer();
             else if (playerGen < 0) releasePlayer();
+            releaseNxt();
         });
     }
 
     public void shutdown() {
         stop();
         clearPrefetch();
-        main.post(this::releasePlayer);
+        main.post(() -> { releasePlayer(); releaseNxt(); });
         try { pool.shutdownNow(); } catch (Throwable ignore) { }
     }
 
