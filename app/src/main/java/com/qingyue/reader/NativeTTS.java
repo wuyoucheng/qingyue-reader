@@ -56,7 +56,7 @@ public class NativeTTS {
     private volatile boolean builtinReady = false;
     private volatile String builtinErr = "";   // 内置引擎初始化失败原因（诊断用）
     private static final String BUILTIN_NAME = "小燕 · 离线女声";
-    private static final String APP_VER = "v1.32";
+    private static final String APP_VER = "v1.33";
 
     /* ---------------- 朗读进度落盘 ----------------
      * 后台连播时网页被系统冻结，它没法保存进度；App 被划掉/被杀时网页更没机会保存。
@@ -1289,6 +1289,24 @@ public class NativeTTS {
             qToken++;
             stopPlaybackInternal();
             notifyProgress(true);
+        });
+    }
+
+    /**
+     * 耳机拔出 / 蓝牙断开时由 PlaybackService 的广播接收器调用：暂停并通知页面。
+     *
+     * 与 pauseQueue 的区别只有两点：多回调一次 __ttsNoisyPause（让页面弹出原因提示），
+     * 且可以在任意线程调用（内部自己 post 到主线程）。
+     */
+    public void pauseForNoisy() {
+        main.post(() -> {
+            if (!qPlaying || qPaused) return;
+            qPaused = true;
+            qToken++;                       // 让在途的合成 / 播放回调全部作废
+            stopPlaybackInternal();
+            saveQueuePos(true);             // 立刻落盘，避免暂停位置丢失
+            notifyProgress(true);           // 通知栏 + 网页状态一起切成「已暂停」
+            evalJs("window.__ttsNoisyPause&&window.__ttsNoisyPause()");
         });
     }
 

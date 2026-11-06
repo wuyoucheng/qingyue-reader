@@ -67,6 +67,13 @@ export class Speaker {
         this.hooks.highlight(-1);
         this.emit();
       };
+      // 耳机拔出 / 蓝牙断开：原生已把队列暂停，这里同步界面并说明原因
+      window.__ttsNoisyPause = () => {
+        const wasPlaying = this.playing && !this.paused;   // 已经暂停/停止时不要重复提示
+        if (this.playing) this.paused = true;
+        this.emit();
+        if (wasPlaying) this.hooks.onError('耳机已断开，朗读已暂停');
+      };
       // 原生定时关闭到点
       window.__ttsTimerEnd = () => {
         this.playing = false;
