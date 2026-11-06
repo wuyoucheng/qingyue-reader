@@ -128,6 +128,10 @@ export class Speaker {
       const s = JSON.parse(this.native.queueState() || '{}');
       if (!s || typeof s.playing !== 'boolean') return null;
       if (typeof s.chapter !== 'number' || s.chapter < 0) return null;
+      // 原生在播别的书时，这份状态与当前页面无关：拿去同步会把 B 书的进度写进 A 书
+      const meta = this.hooks.getMeta ? this.hooks.getMeta() : {};
+      const cur = meta && meta.bookId;
+      if (s.bookId && cur && s.bookId !== cur) return null;
       return s;
     } catch (e) { return null; }
   }
