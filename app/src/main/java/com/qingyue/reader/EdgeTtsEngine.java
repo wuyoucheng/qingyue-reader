@@ -132,6 +132,9 @@ public class EdgeTtsEngine {
 
     public interface Callback {
         void onResult(boolean ok);
+        /** 真正出声的瞬间回调，带上这段音频的时长（毫秒，0 表示未知）。
+         *  合并多句朗读时，上层靠它把高亮在几句之间按时间轴推开。 */
+        default void onStart(long durationMs) { }
     }
 
     /* ===================== 预合成缓存 ===================== */
@@ -480,6 +483,7 @@ public class EdgeTtsEngine {
                 attachListeners(p, f, j);
                 p.prepare();
                 p.start();
+                notifyStart(p, j);
             } catch (Throwable t) {
                 lastError = "play:" + t;
                 Log.w(TAG, "play failed " + t);
@@ -507,6 +511,7 @@ public class EdgeTtsEngine {
                 playerGen = j.my;
                 attachListeners(p, pf, j);
                 p.start();
+                notifyStart(p, j);
             } catch (Throwable t) {
                 lastError = "play2:" + t;
                 Log.w(TAG, "prepared start failed " + t);
@@ -565,6 +570,14 @@ public class EdgeTtsEngine {
         nxt = null; nxtFile = null; nxtKey = ""; nxtGen = -1;
         if (p != null) releaseOne(p);
         if (f != null) deleteQuiet(f);
+    }
+
+    /** 起播回调（带真实音频时长），供上层按时间轴推进合并朗读的高亮 */
+    private void notifyStart(MediaPlayer p, Job j) {
+        long dur = 0;
+        try { dur = p.getDuration(); } catch (Throwable ignore) { }
+        if (dur < 0) dur = 0;
+        try { j.cb.onStart(dur); } catch (Throwable ignore) { }
     }
 
     private void releaseOne(MediaPlayer p) {

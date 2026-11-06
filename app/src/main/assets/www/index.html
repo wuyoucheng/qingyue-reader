@@ -12,7 +12,7 @@
 <link rel="manifest" href="manifest.webmanifest">
 <link rel="apple-touch-icon" href="icons/icon-192.png">
 <link rel="icon" href="icons/icon-192.png">
-<link rel="stylesheet" href="css/app.css?v=1.29">
+<link rel="stylesheet" href="css/app.css?v=1.30">
 </head>
 <body>
 
@@ -199,6 +199,10 @@
         <div><div class="set-t">句间无缝连读</div><div class="set-d">提前准备好下一句，减少换句时的停顿（在线音色）</div></div>
         <label class="switch"><input type="checkbox" id="sw-seamless"><i></i></label>
       </div>
+      <div class="set-row">
+        <div><div class="set-t">短句合并朗读</div><div class="set-d">把相邻短句凑成一段合成，对话多的段落更连贯（高亮按段落跳）</div></div>
+        <label class="switch"><input type="checkbox" id="sw-join"><i></i></label>
+      </div>
     </div>
   </div>
 </div>
@@ -315,6 +319,6 @@
 <input type="file" id="file-input" accept=".txt,.text,.epub,text/plain,application/epub+zip,*/*" multiple style="position:fixed;left:-9999px;top:0;width:1px;height:1px;opacity:0">
 
 <script src="vendor/jszip.min.js"></script>
-<script type="module" src="js/app.js?v=1.29"></script>
+<script type="module" src="js/app.js?v=1.30"></script>
 </body>
 </html>

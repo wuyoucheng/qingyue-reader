@@ -56,7 +56,7 @@ public class NativeTTS {
     private volatile boolean builtinReady = false;
     private volatile String builtinErr = "";   // 内置引擎初始化失败原因（诊断用）
     private static final String BUILTIN_NAME = "小燕 · 离线女声";
-    private static final String APP_VER = "v1.29";
+    private static final String APP_VER = "v1.30";
 
     /* ---------------- 朗读进度落盘 ----------------
      * 后台连播时网页被系统冻结，它没法保存进度；App 被划掉/被杀时网页更没机会保存。
@@ -831,7 +831,11 @@ public class NativeTTS {
     /* ================= 原生朗读队列（后台 / 锁屏续播） ================= */
 
     /** 播放一句的统一入口：按当前音色 Edge → 百度 → 系统 依次降级，回调只表示「这句念完了」 */
-    private interface Once { void onResult(boolean ok); }
+    private interface Once {
+        void onResult(boolean ok);
+        /** 真正出声时回调，durMs 为这段音频时长（0 = 未知，由上层估算） */
+        default void onStart(long durMs) { }
+    }
 
     private void playOnce(final String text, final String nextText, final Once cb, final int token) {
         final String vid = voiceId == null ? DEFAULT_VOICE_ID : voiceId;
@@ -848,15 +852,19 @@ public class NativeTTS {
         }
         if (vid.startsWith("edge:")) {
             // 带上下一句：当前句还在念的时候，原生层就把下一句 prepare 好接棒
-            edge.speak(clean, nextText, voiceShortName(vid), rate, ok -> {
-                if (ok) { cb.onResult(true); return; }
-                edgeErr = edge.getLastError();
-                Log.w(TAG, "queue edge failed: " + edgeErr + ", try baidu");
-                baidu.speak(clean, rate, ok2 -> {
-                    if (ok2) { cb.onResult(true); return; }
-                    edgeErr = edgeErr + " / " + baidu.getLastError();
-                    main.post(() -> systemSpeakOnce(clean, cb, token));
-                });
+            edge.speak(clean, nextText, voiceShortName(vid), rate, new EdgeTtsEngine.Callback() {
+                @Override public void onStart(long durMs) { cb.onStart(durMs); }
+
+                @Override public void onResult(boolean ok) {
+                    if (ok) { cb.onResult(true); return; }
+                    edgeErr = edge.getLastError();
+                    Log.w(TAG, "queue edge failed: " + edgeErr + ", try baidu");
+                    baidu.speak(clean, rate, ok2 -> {
+                        if (ok2) { cb.onResult(true); return; }
+                        edgeErr = edgeErr + " / " + baidu.getLastError();
+                        main.post(() -> systemSpeakOnce(clean, cb, token));
+                    });
+                }
             });
             return;
         }
@@ -1032,72 +1040,195 @@ public class NativeTTS {
         }
     };
 
+    /* ---------------- 短句合并（v1.30） ----------------
+     * 每句单独合成时，换句都要重走「建连/取缓存 → 建播放器 → 起播」，
+     * 遇到对话体那种七八个字的短句，一句一两秒就要换一次，顿挫非常明显。
+     * 这里把相邻短句凑成一个「朗读单元」一次合成播放，句间只剩音频自身的停顿。
+     * 队列结构不变（仍按句索引），单元内高亮按字数比例随时间轴推进。 */
+    private static final int UNIT_TARGET = 34;        // 目标字数：凑到这么多就停
+    private static final int UNIT_MAX_SENT = 5;       // 一个单元最多几句
+    private static final int UNIT_MAX_CHARS = 120;    // 单次合成上限，避免长段合成过慢
+
+    /** 短句合并开关（关闭即退回一句一合成，v1.29 行为） */
+    private volatile boolean joinShort = true;
+
+    private static String sOf(List<String> list, int i) {
+        if (i < 0 || i >= list.size()) return "";
+        String s = list.get(i);
+        return s == null ? "" : s.trim();
+    }
+
+    /** 从 i 起的一个朗读单元结束位置（exclusive）。joinShort 关闭时恒为 i+1 */
+    private int unitEndIn(List<String> list, int i) {
+        final int size = list.size();
+        if (i >= size) return i;
+        if (!joinShort) return i + 1;
+        int end = i, chars = 0;
+        while (end < size && end - i < UNIT_MAX_SENT) {
+            int l = sOf(list, end).length();
+            if (l == 0) { if (end == i) end++; break; }   // 空句自己占一个单元，交给 playAt 跳过
+            if (end > i && chars + l > UNIT_TARGET + 16) break;
+            if (end > i && chars + l > UNIT_MAX_CHARS) break;
+            chars += l;
+            end++;
+            if (chars >= UNIT_TARGET) break;
+        }
+        return end <= i ? i + 1 : end;
+    }
+
+    private int unitEnd(int i) { return unitEndIn(queue, i); }
+
+    /** 把 [from,to) 拼成一段合成文本；句子自带标点就直接接，缺了就补个逗号 */
+    private static String unitTextIn(List<String> list, int from, int to) {
+        StringBuilder sb = new StringBuilder();
+        for (int k = from; k < to; k++) {
+            String s = sOf(list, k);
+            if (s.isEmpty()) continue;
+            if (sb.length() > 0 && !endsWithPunct(sb)) sb.append('，');
+            sb.append(s);
+        }
+        return sb.toString();
+    }
+
+    private static boolean endsWithPunct(CharSequence s) {
+        if (s.length() == 0) return false;
+        char c = s.charAt(s.length() - 1);
+        return c == '。' || c == '！' || c == '？' || c == '…' || c == '，' || c == '；'
+                || c == '：' || c == '”' || c == '」' || c == '』' || c == '.' || c == '!'
+                || c == '?' || c == ',' || c == ';' || c == ':';
+    }
+
+    /** 估算一段文本的朗读时长（毫秒）：中文约 4.6 字/秒，随语速缩放 */
+    private long estimateMs(String text, int chars) {
+        float r = rate <= 0 ? 1f : rate;
+        double cps = 4.6 * r;
+        if (cps <= 0.1) cps = 0.1;
+        int n = chars > 0 ? chars : (text == null ? 0 : text.length());
+        return Math.max(600, (long) (n / cps * 1000));
+    }
+
+    /**
+     * 单元内高亮推进：按每句字数比例把 qIndex 从 from 推到 to-1。
+     * 只影响高亮与进度上报，单元播完一定会跳到 to（见 playAt 的 onResult）。
+     */
+    private void pushUnitHighlight(final int from, final int to, final long durMs, final int token) {
+        if (to - from <= 1 || durMs <= 0) return;
+        int total = 0;
+        final int n = to - from;
+        final int[] cum = new int[n];
+        for (int k = from; k < to; k++) {
+            cum[k - from] = total;
+            total += Math.max(1, sOf(queue, k).length());
+        }
+        if (total <= 0) return;
+        for (int k = from + 1; k < to; k++) {
+            final int idx = k;
+            long at = (long) (durMs * (cum[k - from] / (double) total));
+            main.postDelayed(() -> {
+                if (token != qToken) return;        // 已切句/暂停/停止
+                if (!qPlaying || qPaused) return;
+                if (qIndex >= idx) return;
+                qIndex = idx;
+                notifyProgress(true);
+                saveQueuePos(false);
+            }, Math.max(0, at));
+        }
+    }
+
     private void playAt(final int i) {
         if (!qPlaying || qPaused) return;
         if (i >= queue.size()) { advanceChapter(); return; }
 
         final int token = ++qToken;
-        final String text = queue.get(i);
-        // 下一句交给原生层提前 prepare，播完直接接棒（跨章不接，跨章要整段换队列）
-        final String nextText = (i + 1 < queue.size()) ? queue.get(i + 1) : null;
+        final int end = Math.min(unitEnd(i), queue.size());      // 本朗读单元的结束（exclusive）
+        final String text = unitTextIn(queue, i, end);
+        // 下一个单元也一并交给原生层提前 prepare，播完直接接棒（跨章不接，跨章要整段换队列）
+        final int nextEnd = end < queue.size() ? Math.min(unitEnd(end), queue.size()) : end;
+        final String nextText = nextEnd > end ? unitTextIn(queue, end, nextEnd) : null;
         qIndex = i;
         saveQueuePos(false);          // 后台/被杀也留个位置（有节流，不会频繁写盘）
 
-        if (text == null || text.trim().isEmpty()) {
+        if (text.isEmpty()) {
             notifyProgress(true);
-            main.postDelayed(() -> { if (token == qToken) playAt(i + 1); }, 10);
+            main.postDelayed(() -> { if (token == qToken) playAt(Math.max(end, i + 1)); }, 10);
             return;
         }
 
-        playOnce(text, nextText, ok -> {
-            if (token != qToken) return;             // 已被手动切句/停止
-            if (!qPlaying || qPaused) return;
-            if (ok) {
-                qErrStreak = 0;
-                // 上一句快念完了，下一句（多半已准备就绪）几乎可以立刻接上，不留空窗
-                main.post(() -> { if (token == qToken) playAt(i + 1); });
-            } else {
-                qErrStreak++;
-                if (qErrStreak >= 4) {
-                    stopQueue();
-                    evalJs("window.__ttsQueueError&&window.__ttsQueueError('语音朗读连续失败：" + esc(safeStr(edgeErr)) + "')");
-                    return;
+        // 单元内高亮：优先用真实音频时长（起播回调给），拿不到就用字数估算
+        final int chars = text.length();
+        final long[] durBox = { 0 };
+        final boolean[] pushed = { false };
+        final Runnable push = () -> {
+            if (pushed[0] || token != qToken) return;
+            pushed[0] = true;
+            pushUnitHighlight(i, end, durBox[0] > 0 ? durBox[0] : estimateMs(null, chars), token);
+        };
+        main.postDelayed(push, 400);
+
+        playOnce(text, nextText, new Once() {
+            @Override public void onStart(long durMs) {
+                if (token != qToken) return;
+                if (durMs > 0) durBox[0] = durMs;
+                push.run();
+            }
+
+            @Override public void onResult(boolean ok) {
+                if (token != qToken) return;             // 已被手动切句/停止
+                if (!qPlaying || qPaused) return;
+                if (ok) {
+                    qErrStreak = 0;
+                    if (end - 1 > qIndex) qIndex = end - 1;   // 整个单元念完，进度落到末句
+                    // 上一段快念完了，下一段（多半已准备就绪）几乎可以立刻接上，不留空窗
+                    main.post(() -> { if (token == qToken) playAt(end); });
+                } else {
+                    qErrStreak++;
+                    if (qErrStreak >= 4) {
+                        stopQueue();
+                        evalJs("window.__ttsQueueError&&window.__ttsQueueError('语音朗读连续失败：" + esc(safeStr(edgeErr)) + "')");
+                        return;
+                    }
+                    main.postDelayed(() -> { if (token == qToken) playAt(end); }, 80);
                 }
-                main.postDelayed(() -> { if (token == qToken) playAt(i + 1); }, 80);
             }
         }, token);
 
         // 出声之后再更新高亮/进度：把主线程让给音频启动，少几十毫秒也是几十毫秒
         main.post(() -> { if (token == qToken) notifyProgress(true); });
 
-        // 当前句已经在念了，趁这段时间把后面几句合成好（命中缓存的句子不再重复请求）
+        // 当前单元已经在念了，趁这段时间把后面几个单元合成好（命中缓存的直接复用）
         prefetchAhead(i);
     }
 
     /**
-     * 预取后两句。逐句在线合成时，每句都要「建连接 → 合成 → 落盘」，
+     * 预取后面几个朗读单元。逐段在线合成时，每段都要「建连接 → 合成 → 落盘」，
      * 一段念完到下一段出声之间会空几百毫秒，听感就是明显停顿。
-     * 提前合成好后，下一句直接命中缓存开播，句间几乎无缝。
+     * 提前合成好后，下一段直接命中缓存开播，段间几乎无缝。
+     * 注意：这里必须用和 playAt 完全相同的合并规则，否则永远命不中缓存。
      */
     private void prefetchAhead(final int i) {
         final String vid = voiceId == null ? DEFAULT_VOICE_ID : voiceId;
         if (!vid.startsWith("edge:")) return;        // 百度/系统音色没有预取通道
         final String v = voiceShortName(vid);
-        // 多预取几句：无缝接续要「下一句已经躺在缓存里」，只有 3 句时一遇到长句/网络抖动就断档
-        for (int k = i + 1; k <= i + 5; k++) {
-            String t;
-            if (k < queue.size()) {
-                t = queue.get(k);
-            } else if (!qPending.isEmpty()) {
-                // 跨到下一章的前几句，章末切换时就不会再等合成
-                int j = k - queue.size();
-                List<String> nx = qPending.get(0).s;
-                t = j < nx.size() ? nx.get(j) : null;
-            } else {
-                t = null;
+        // 一个单元通常 20~40 字（约 5~9 秒），预取 3 个就是小半分钟，够扛住网络抖动
+        int k = unitEnd(i);
+        int n = 0;
+        while (n < 3 && k < queue.size()) {
+            int e = Math.min(unitEnd(k), queue.size());
+            edge.prefetch(unitTextIn(queue, k, e), v, rate);
+            k = e;
+            n++;
+        }
+        // 跨到下一章的前几个单元，章末切换时就不会再等合成
+        if (n < 3 && !qPending.isEmpty()) {
+            List<String> nx = qPending.get(0).s;
+            int j = Math.max(0, k - queue.size());
+            int m = 0;
+            while (m < 3 - n && j < nx.size()) {
+                int e = Math.min(unitEndIn(nx, j), nx.size());
+                edge.prefetch(unitTextIn(nx, j, e), v, rate);
+                j = e;
+                m++;
             }
-            if (t == null || t.trim().isEmpty()) continue;
-            edge.prefetch(t, v, rate);
         }
     }
 
@@ -1362,6 +1493,17 @@ public class NativeTTS {
     @JavascriptInterface
     public boolean isSeamless() {
         return edge.isSeamless();
+    }
+
+    /** 短句合并朗读开关（默认开）：把相邻短句凑一段合成，减少换句次数。关掉即一句一合成 */
+    @JavascriptInterface
+    public void setJoinShort(boolean on) {
+        joinShort = on;
+    }
+
+    @JavascriptInterface
+    public boolean isJoinShort() {
+        return joinShort;
     }
 
     @JavascriptInterface
