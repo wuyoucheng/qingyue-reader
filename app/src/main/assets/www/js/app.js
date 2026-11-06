@@ -201,6 +201,10 @@ const app = {
   },
 
   showPage(name) {
+    // 离开阅读页时先存一次（趁版面还在、还量得到真实位置）
+    if (name !== 'reader' && $('page-reader').classList.contains('active') && reader.book) {
+      reader.saveProgress();
+    }
     $('page-library').classList.toggle('active', name === 'library');
     $('page-reader').classList.toggle('active', name === 'reader');
   },

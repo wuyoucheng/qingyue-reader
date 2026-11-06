@@ -86,7 +86,7 @@ export const reader = {
     }, { passive: true });
 
     // 用户自己动手了就放弃自动定位，避免"回位"跟用户抢滚动条
-    const markUser = () => { this._userScrolled = true; };
+    const markUser = () => { this._userScrolled = true; this._hold = null; };
     ['touchstart', 'wheel', 'mousedown', 'keydown'].forEach(ev =>
       this.el.scroll.addEventListener(ev, markUser, { passive: true }));
 
@@ -177,6 +177,8 @@ export const reader = {
     let rblock = p.blockIndex || 0;
     let rratio = p.ratio || 0;
     this._baseChapter = idx;
+    // 记一份「可用的上次位置」：之后版面量不到时用它兜底，不会被假数据覆盖
+    this._lastPos = { chapterIndex: idx, blockIndex: rblock, ratio: rratio };
 
     // 原生队列还活着（App 重进、或网页被系统重载但朗读没停）：
     // 这时朗读进度才是真的，网页里存的那份是冻结前的旧位置。
@@ -259,6 +261,11 @@ export const reader = {
     if (!opt.auto && this.speaker && this.speaker.playing) this.speaker.stop();
     index = Math.max(0, Math.min(index, this.titles.length - 1));
     this.chapterIndex = index;
+    this._hold = null;
+    clearInterval(this._holdTimer);
+    this._holdTimer = null;
+    clearTimeout(this._retryTimer);
+    this._retryTimer = null;
     const ch = await db.getChapter(this.book.id, index);
     if (!ch) return;
     this.chapter = ch;
@@ -339,7 +346,7 @@ export const reader = {
         this.page = p;
         this.el.content.style.transition = 'none';
         this.el.content.style.transform = `translateX(${-p * this.step}px)`;
-        ok = p > 0;
+        ok = true;                       // 算出了页码并应用，就算成功（p=0 就是本来在开头）
         this._diagPush('k' + k + ' 翻页 p=' + p + '/' + this.pages);
         if (ok) requestAnimationFrame(() => { this.el.content.style.transition = ''; });
       } else {
@@ -375,19 +382,84 @@ export const reader = {
     this._userScrolled = false;
     this._restoreDone = ok;
     this._diagPush('恢复' + (ok ? '成功' : '失败') + ' 目标block=' + block + ' ratio=' + (ratio || 0).toFixed(3));
+    if (ok) this._holdPos(block, ratio);
     this.afterRender();
 
     // 兜底：过 800ms 还没到位，再补一次（真机布局可能更慢）
     if (!ok && (this._restoreTries || 0) < 2) {
       this._restoreTries = (this._restoreTries || 0) + 1;
-      setTimeout(() => {
+      clearTimeout(this._retryTimer);
+      this._retryTimer = setTimeout(() => {
         if (!this._restoreDone && !this._userScrolled) this.restoreTo(block, ratio);
       }, 800);
     }
   },
 
-  /** 页面重新可见时，若上次没回到位就再补一次 */
-  retryRestore() {
+  /** 主动翻页/跳章后，取消还在排队的「回位重试」，别把用户的操作顶回去 */
+  cancelRestore() {
+    this._want = null;
+    this._restoreDone = true;
+    this._hold = null;
+    clearTimeout(this._retryTimer);
+    clearInterval(this._holdTimer);
+    this._retryTimer = null;
+    this._holdTimer = null;
+  },
+
+  /**
+   * 回位之后把目标位置「按住」几秒。
+   * 真机上字体/图片/WebView 首帧常晚于我们恢复，一次到位后又被顶回章首；
+   * 这几秒里只要用户没动手，就继续把位置按回去。
+   */
+  _holdPos(block, ratio) {
+    this._hold = { block, ratio, until: Date.now() + 4000 };
+    clearInterval(this._holdTimer);
+    this._holdTimer = setInterval(() => this._applyHold(), 150);
+    setTimeout(() => { clearInterval(this._holdTimer); this._holdTimer = null; }, 4300);
+  },
+
+  _applyHold() {
+    const h = this._hold;
+    if (!h || Date.now() > h.until || this._userScrolled) { this._hold = null; clearInterval(this._holdTimer); this._holdTimer = null; return; }
+    if (!this.hasLayout()) return;
+
+    if (settings.scrollMode === 'page') {
+      // 翻页模式：版面（行高/字号/字体）晚到会让每页的偏移量变，按句/比例重算一次页码
+      this.measurePages(true);
+      if (this.pages <= 1) return;
+      const el = h.block > 0 ? this.spans[h.block] : null;
+      let p = el ? Math.round(el.offsetLeft / (this.step || 1)) : 0;
+      if ((p <= 0 || p >= this.pages) && h.ratio > 0.02) p = Math.round(h.ratio * (this.pages - 1));
+      p = Math.max(0, Math.min(this.pages - 1, p));
+      if (p !== this.page && p > 0) {
+        this.page = p;
+        this.el.content.style.transition = 'none';
+        this.el.content.style.transform = `translateX(${-p * this.step}px)`;
+        this._diagPush('锁定翻页 p=' + p + '/' + this.pages);
+      }
+      return;
+    }
+
+    const sc = this.el.scroll;
+    const max = sc.scrollHeight - sc.clientHeight;
+    if (max <= 0) return;
+    let y = null;
+    const el = h.block > 0 ? this.spans[h.block] : null;
+    if (el) {
+      const r = el.getBoundingClientRect(), sr = sc.getBoundingClientRect();
+      y = r.top - sr.top + sc.scrollTop - 8;
+    } else if (h.ratio > 0.02) {
+      y = h.ratio * max;
+    }
+    if (y == null) return;
+    y = Math.max(0, Math.min(max, Math.round(y)));
+    if (Math.abs(sc.scrollTop - y) > 24) {
+      sc.scrollTop = y;
+      this._diagPush('锁定回位 目标=' + y + ' 实到=' + Math.round(sc.scrollTop));
+    }
+  },
+
+  /** 页面重新可见时，若上次没回到位就再补一次 */  retryRestore() {
     if (!this._want || this._restoreDone || this._userScrolled) return;
     if ((this._restoreTries || 0) >= 2) return;
     this._restoreTries = (this._restoreTries || 0) + 1;
@@ -409,11 +481,13 @@ export const reader = {
     try { wlog = JSON.parse(localStorage.getItem('nr.wlog') || '[]'); } catch (e) {}
     const sc = this.el.scroll;
     const lines = [
-      '【阅读位置诊断 v1.26】',
+      '【阅读位置诊断 v1.27】',
       '书: ' + (this.book ? this.book.title : '-'),
       '当前: 第' + (this.chapterIndex + 1) + '章 block=' + this.currentBlock(),
       '滚动: top=' + Math.round(sc.scrollTop) + ' / max=' + Math.round(sc.scrollHeight - sc.clientHeight),
       '屏高=' + sc.clientHeight + ' 屏宽=' + sc.clientWidth + ' 模式=' + settings.scrollMode,
+      '版面可量=' + this.hasLayout() + ' 页面active=' + this.el.page.classList.contains('active'),
+      '上次有效位置: ' + (this._lastPos ? JSON.stringify(this._lastPos) : '无'),
       '听书: playing=' + (this.speaker && this.speaker.playing) + ' 读到句=' + (this._ttsBlock == null ? '-' : this._ttsBlock),
       '原生: ' + (ns ? ('第' + (ns.chapter + 1) + '章 ' + ((ns.index || 0) + 1) + '/' + ns.total + ' playing=' + ns.playing + ' paused=' + ns.paused) : '无'),
       '库里存的: ' + saved,
@@ -456,20 +530,48 @@ export const reader = {
     el.querySelector('.rd-chapter-title').style.fontFamily = fam;
     const pm = s.scrollMode === 'page';
     this.el.scroll.classList.toggle('page-mode', pm);
+    if (!pm) {
+      // 切回滚动模式：必须清掉列宽，否则残留的多列会让正文横向被裁掉
+      this.el.content.style.columnWidth = '';
+      this.el.content.style.columnCount = '';
+      this.el.content.style.transform = '';
+      this._colW = 0;
+    }
     if (pm) requestAnimationFrame(() => this.measurePages(true));
   },
 
   measurePages(stay = false) {
     const c = this.el.content;
+    if (settings.scrollMode === 'page') {
+      // 列宽必须是实测像素：column-width 不支持百分比，写 100% 会让多列排布整体失效
+      const cs = getComputedStyle(c);
+      const inner = Math.round(c.clientWidth - (parseFloat(cs.paddingLeft) || 0) - (parseFloat(cs.paddingRight) || 0));
+      if (inner > 0 && this._colW !== inner) {
+        this._colW = inner;
+        c.style.columnWidth = inner + 'px';
+        c.style.columnCount = 'auto';
+      }
+    }
     const gap = parseFloat(getComputedStyle(c).columnGap) || 0;
     const w = c.clientWidth;
     this.step = w + gap;
-    this.pages = Math.max(1, Math.round(c.scrollWidth / this.step));
+    // 页数按「最后一个句子排到的位置」算：scrollWidth 会把末尾的列间距也算进去，
+    // 直接用它会多出半页空白，翻到最后一页就什么都看不到
+    const last = this.spans[this.spans.length - 1];
+    if (last) {
+      const base = this.spans[0] ? this.spans[0].offsetLeft : 0;
+      const end = last.offsetLeft - base + last.offsetWidth;
+      this.pages = Math.max(1, Math.floor((end - 1) / this.step) + 1);
+    } else {
+      this.pages = Math.max(1, Math.round(c.scrollWidth / this.step));
+    }
     if (!stay) this.goPage(Math.min(this.page, this.pages - 1));
   },
 
   goPage(p) {
     if (settings.scrollMode !== 'page') return;
+    // 用户/代码主动翻页：不再自动按住旧位置，也取消还没跑完的回位重试
+    this.cancelRestore();
     if (p < 0) { if (this.chapterIndex > 0) this.loadChapter(this.chapterIndex - 1, { toTop: true }); return; }
     if (p >= this.pages) {
       if (this.chapterIndex + 1 < this.titles.length) this.loadChapter(this.chapterIndex + 1, { toTop: true });
@@ -483,11 +585,23 @@ export const reader = {
   },
 
   /* ---------------- 进度 ---------------- */
+  /**
+   * 版面现在能不能量到真实位置。
+   * 阅读页被隐藏（切到书架、App 在后台）时 display:none，scrollHeight/clientHeight 全是 0，
+   * 这时候读出来的 block/ratio 是假的（ratio 会算成 1 = 章末），绝不能拿去存。
+   */
+  hasLayout() {
+    const sc = this.el.scroll;
+    return this.el.page.classList.contains('active') && sc.clientHeight > 0;
+  },
+
   currentRatio() {
     const sc = this.el.scroll;
     if (settings.scrollMode === 'page') return this.pages > 1 ? this.page / (this.pages - 1) : 1;
     const max = sc.scrollHeight - sc.clientHeight;
-    if (max <= 0) return 1;
+    // 内容比屏幕短（整章一屏能看完）：1 是对的；
+    // 但版面不可见时 max 也是 0，那种情况返回 0，别把「章末」写进进度
+    if (max <= 0) return this.hasLayout() ? 1 : 0;
     return Math.min(1, Math.max(0, sc.scrollTop / max));
   },
 
@@ -521,12 +635,23 @@ export const reader = {
     let block = this.currentBlock();
     let chIdx = this.chapterIndex;
     let src = 'web';
+    // 阅读页已经隐藏（切到书架 / App 在后台）：DOM 量出来是 0/1 这种假值，
+    // 这种情况直接把上次存过的有效位置原样再写一次，别拿假位置覆盖
+    const blind = !this.hasLayout();
 
     // 回位没做完就被要求存（切后台/退出）：存「目标位置」，别存半成品
     if (this._restoring && this._want) {
       block = this._want.block || block;
       ratio = this._want.ratio || ratio;
       src = 'restoring->want';
+    } else if (blind) {
+      const last = this._lastPos;
+      if (last) {
+        chIdx = last.chapterIndex; block = last.blockIndex; ratio = last.ratio;
+        src = 'blind->last';
+      } else if (!force) {
+        return;                                 // 没有可信位置就什么都不写
+      }
     }
 
     // 原生队列才是真位置：后台连播会自己跨章，网页这边还冻在老章上
@@ -565,6 +690,7 @@ export const reader = {
       lastReadAt: Date.now(),
     };
     this._baseChapter = chIdx;
+    this._lastPos = { chapterIndex: chIdx, blockIndex: block, ratio };
     Object.assign(this.book, patch);
     this.savePosLocal(patch.progress);          // 先写本地备份，数据库失败也不丢
     this._wlog(chIdx, block, src);
@@ -699,8 +825,8 @@ export const reader = {
   let lastTop = 0, lock = 0, lastChapter = -1;
   sc.addEventListener('scroll', () => {
     if (!settings.autoNext || settings.scrollMode === 'page' || !reader.book) return;
-    // 程序在恢复上次位置，不是用户在往下滑，别误判成"读到底了"
-    if (reader._restoring) { lastTop = sc.scrollTop; return; }
+    // 程序在恢复上次位置（或恢复后正在按住位置），不是用户在往下滑，别误判成"读到底了"
+    if (reader._restoring || reader._hold) { lastTop = sc.scrollTop; return; }
     // 换章后的第一次滚动不判断方向
     if (reader.chapterIndex !== lastChapter) { lastChapter = reader.chapterIndex; lastTop = sc.scrollTop; return; }
     const max = sc.scrollHeight - sc.clientHeight;

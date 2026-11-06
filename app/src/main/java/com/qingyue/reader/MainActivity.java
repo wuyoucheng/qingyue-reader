@@ -373,7 +373,8 @@ public class MainActivity extends ComponentActivity {
         ws.setSupportZoom(false);
         ws.setBuiltInZoomControls(false);
         ws.setMediaPlaybackRequiresUserGesture(false);
-        ws.setCacheMode(WebSettings.LOAD_DEFAULT);
+        // 页面资源是随 APK 打包的本地 assets：禁用 HTTP 缓存，避免升级后还在跑旧的 js/css
+        ws.setCacheMode(WebSettings.LOAD_NO_CACHE);
         ws.setDefaultTextEncodingName("UTF-8");
         ws.setMixedContentMode(WebSettings.MIXED_CONTENT_NEVER_ALLOW);
         ws.setUserAgentString(ws.getUserAgentString() + " QingYueReader/1.1");
