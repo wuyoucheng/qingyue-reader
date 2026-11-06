@@ -56,7 +56,7 @@ public class NativeTTS {
     private volatile boolean builtinReady = false;
     private volatile String builtinErr = "";   // 内置引擎初始化失败原因（诊断用）
     private static final String BUILTIN_NAME = "小燕 · 离线女声";
-    private static final String APP_VER = "v1.31";
+    private static final String APP_VER = "v1.32";
 
     /* ---------------- 朗读进度落盘 ----------------
      * 后台连播时网页被系统冻结，它没法保存进度；App 被划掉/被杀时网页更没机会保存。
@@ -1401,6 +1401,7 @@ public class NativeTTS {
             o.put("chapter", qChapter);
             o.put("title", qTitle);
             o.put("book", qBook);
+            o.put("bookId", qBookId == null ? "" : qBookId);
             long left = qTimerEndAt > 0 ? Math.max(0, (qTimerEndAt - System.currentTimeMillis()) / 1000) : 0;
             o.put("timerLeft", left);
             return o.toString();
