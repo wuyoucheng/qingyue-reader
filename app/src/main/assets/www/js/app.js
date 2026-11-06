@@ -2,11 +2,11 @@
  * app.js — 主控制器：书架、导入、目录、设置、听书面板、路由
  */
 
-import { db, newId, storageInfo } from './db.js?v=1.32';
-import { settings, saveSettings } from './settings.js?v=1.32';
-import { parseFile } from './parser.js?v=1.32';
-import { reader } from './reader.js?v=1.32';
-import { ttsSupported, isNativeApp } from './tts.js?v=1.32';
+import { db, newId, storageInfo } from './db.js?v=1.33';
+import { settings, saveSettings } from './settings.js?v=1.33';
+import { parseFile } from './parser.js?v=1.33';
+import { reader } from './reader.js?v=1.33';
+import { ttsSupported, isNativeApp } from './tts.js?v=1.33';
 
 const $ = id => document.getElementById(id);
 const GRADS = [
