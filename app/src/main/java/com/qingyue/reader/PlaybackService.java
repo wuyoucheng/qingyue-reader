@@ -5,9 +5,12 @@ import android.app.NotificationChannel;
 import android.app.NotificationManager;
 import android.app.PendingIntent;
 import android.app.Service;
+import android.content.BroadcastReceiver;
 import android.content.Context;
 import android.content.Intent;
+import android.content.IntentFilter;
 import android.content.pm.ServiceInfo;
+import android.media.AudioManager;
 import android.net.wifi.WifiManager;
 import android.os.Build;
 import android.os.IBinder;
@@ -33,6 +36,8 @@ public class PlaybackService extends Service {
     public static final String ACTION_START = "com.qingyue.reader.action.PLAY_START";
     public static final String ACTION_UPDATE = "com.qingyue.reader.action.PLAY_UPDATE";
     public static final String ACTION_STOP = "com.qingyue.reader.action.PLAY_STOP";
+    public static final String ACTION_PAUSE = "com.qingyue.reader.action.PLAY_PAUSE";
+    public static final String ACTION_RESUME = "com.qingyue.reader.action.PLAY_RESUME";
 
     public static final String EXTRA_TITLE = "title";     // 书名 · 章节
     public static final String EXTRA_TEXT = "text";       // 当前句 / 进度
@@ -40,6 +45,16 @@ public class PlaybackService extends Service {
 
     private PowerManager.WakeLock wakeLock;
     private WifiManager.WifiLock wifiLock;
+
+    /**
+     * 耳机拔出 / 蓝牙耳机断开监听。
+     *
+     * 系统在「正在通过耳机出声的媒体应用」失去输出设备时会广播 ACTION_AUDIO_BECOMING_NOISY，
+     * 但它**不会**替应用暂停播放，必须应用自己处理，否则声音会突然从外放放出来
+     * （地铁/办公室场景非常尴尬）。Edge / 百度 / 系统语音都是媒体流，
+     * 一个接收器就能全部覆盖。
+     */
+    private BroadcastReceiver noisyReceiver;
 
     /** 前台服务是否真的生效（失败时锁屏大概率被冻结，用于诊断） */
     public static volatile boolean foregroundOk = false;
@@ -112,20 +127,80 @@ public class PlaybackService extends Service {
             return START_NOT_STICKY;
         }
 
+        // 通知栏「暂停 / 继续」：拔掉耳机自动暂停后，插回耳机不必再打开 App
+        if (ACTION_PAUSE.equals(action) || ACTION_RESUME.equals(action)) {
+            boolean resume = ACTION_RESUME.equals(action);
+            try {
+                NativeTTS t = NativeTTS.instance();
+                if (t != null) {
+                    if (resume) t.resumeQueue(); else t.pauseQueue();
+                }
+            } catch (Throwable ignore) { }
+            String tt = safe(intent.getStringExtra(EXTRA_TITLE));
+            String tx = safe(intent.getStringExtra(EXTRA_TEXT));
+            startForegroundCompat(tt, tx, resume);
+            acquireLocks();
+            registerNoisyReceiver();
+            return START_STICKY;
+        }
+
         String title = intent.getStringExtra(EXTRA_TITLE) == null ? "" : safe(intent.getStringExtra(EXTRA_TITLE));
         String text = intent.getStringExtra(EXTRA_TEXT) == null ? "" : safe(intent.getStringExtra(EXTRA_TEXT));
         boolean playing = intent.getBooleanExtra(EXTRA_PLAYING, true);
 
         startForegroundCompat(title, text, playing);
         acquireLocks();
+        registerNoisyReceiver();
         return START_STICKY;
     }
 
     @Override
     public void onDestroy() {
         Log.i(TAG, "onDestroy（锁屏保活结束）");
+        unregisterNoisyReceiver();
         releaseLocks();
         super.onDestroy();
+    }
+
+    /* ---------------- 耳机断开自动暂停 ---------------- */
+
+    private void registerNoisyReceiver() {
+        if (noisyReceiver != null) return;         // 服务被多次 start 时只注册一次
+        noisyReceiver = new BroadcastReceiver() {
+            @Override
+            public void onReceive(Context context, Intent intent) {
+                if (intent == null || !AudioManager.ACTION_AUDIO_BECOMING_NOISY.equals(intent.getAction())) return;
+                Log.i(TAG, "耳机断开，自动暂停朗读");
+                try {
+                    NativeTTS t = NativeTTS.instance();
+                    if (t != null) t.pauseForNoisy();
+                } catch (Throwable ignore) { }
+                // 服务与通知都保留：插回耳机后点「继续」即可接着听
+            }
+        };
+        IntentFilter f = new IntentFilter(AudioManager.ACTION_AUDIO_BECOMING_NOISY);
+        try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                // 系统广播在 RECEIVER_NOT_EXPORTED 下依然能收到
+                registerReceiver(noisyReceiver, f, Context.RECEIVER_NOT_EXPORTED);
+            } else {
+                registerReceiver(noisyReceiver, f);
+            }
+        } catch (Throwable t) {
+            // 个别 ROM 对 NOT_EXPORTED 处理异常：退回无 flag 的注册方式
+            try {
+                registerReceiver(noisyReceiver, f);
+            } catch (Throwable t2) {
+                Log.w(TAG, "registerReceiver: " + t2);
+                noisyReceiver = null;
+            }
+        }
+    }
+
+    private void unregisterNoisyReceiver() {
+        if (noisyReceiver == null) return;
+        try { unregisterReceiver(noisyReceiver); } catch (Throwable ignore) { }
+        noisyReceiver = null;
     }
 
     @Override
@@ -162,6 +237,12 @@ public class PlaybackService extends Service {
 
             PendingIntent stopPi = PendingIntent.getService(this, 1,
                     new Intent(this, PlaybackService.class).setAction(ACTION_STOP), piFlags);
+            // 暂停/继续：带着当前文案，切换时通知不会变成空白
+            PendingIntent togglePi = PendingIntent.getService(this, playing ? 2 : 3,
+                    new Intent(this, PlaybackService.class)
+                            .setAction(playing ? ACTION_PAUSE : ACTION_RESUME)
+                            .putExtra(EXTRA_TITLE, title)
+                            .putExtra(EXTRA_TEXT, text), piFlags);
 
             Notification.Builder b;
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
@@ -177,6 +258,9 @@ public class PlaybackService extends Service {
                     .setOngoing(playing)
                     .setOnlyAlertOnce(true)
                     .setShowWhen(false)
+                    .addAction(new Notification.Action.Builder(
+                            playing ? android.R.drawable.ic_media_pause : android.R.drawable.ic_media_play,
+                            playing ? "暂停" : "继续", togglePi).build())
                     .addAction(new Notification.Action.Builder(
                             android.R.drawable.ic_delete, "停止", stopPi).build());
 
