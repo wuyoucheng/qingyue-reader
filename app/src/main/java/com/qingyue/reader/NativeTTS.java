@@ -56,7 +56,7 @@ public class NativeTTS {
     private volatile boolean builtinReady = false;
     private volatile String builtinErr = "";   // 内置引擎初始化失败原因（诊断用）
     private static final String BUILTIN_NAME = "小燕 · 离线女声";
-    private static final String APP_VER = "v1.30";
+    private static final String APP_VER = "v1.31";
 
     /* ---------------- 朗读进度落盘 ----------------
      * 后台连播时网页被系统冻结，它没法保存进度；App 被划掉/被杀时网页更没机会保存。
@@ -196,6 +196,7 @@ public class NativeTTS {
         }
     };
     private volatile int qErrStreak = 0;
+    private volatile int qErrSent = 0;           // 连续失败的「句数」累计（合并单元一次可能丢多句）
     private volatile int qLastNotified = -1;
     private volatile long qLastAdvanceAt = 0;    // 上次真正推进句子/章节的时间
 
@@ -1177,17 +1178,23 @@ public class NativeTTS {
                 if (!qPlaying || qPaused) return;
                 if (ok) {
                     qErrStreak = 0;
+                    qErrSent = 0;
                     if (end - 1 > qIndex) qIndex = end - 1;   // 整个单元念完，进度落到末句
                     // 上一段快念完了，下一段（多半已准备就绪）几乎可以立刻接上，不留空窗
                     main.post(() -> { if (token == qToken) playAt(end); });
                 } else {
+                    // 三个引擎（Edge → 百度 → 系统）都失败才会走到这里。
+                    // 只跳过一句而不是整个单元：合并单元最多 5 句，跳整段会一口气丢一大段内容，
+                    // 下一轮 playAt 会自动把剩下的重新合并，损失最小。
                     qErrStreak++;
-                    if (qErrStreak >= 4) {
+                    qErrSent += Math.max(1, end - i);
+                    if (qErrSent >= 10) {
                         stopQueue();
                         evalJs("window.__ttsQueueError&&window.__ttsQueueError('语音朗读连续失败：" + esc(safeStr(edgeErr)) + "')");
                         return;
                     }
-                    main.postDelayed(() -> { if (token == qToken) playAt(end); }, 80);
+                    final int next = Math.min(i + 1, queue.size());
+                    main.postDelayed(() -> { if (token == qToken) playAt(next); }, 80);
                 }
             }
         }, token);

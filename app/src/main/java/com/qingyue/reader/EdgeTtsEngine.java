@@ -260,6 +260,11 @@ public class EdgeTtsEngine {
         final Callback cb;
         final int my;
         boolean nextRetried = false;
+        // 合成超时用：同一次 speak 可能因 403 重连，gen 每次连都递增，旧定时器自然失效
+        int gen = 0;
+        volatile boolean finished = false;
+        /** 已被判失败（超时/上层切走）：之后迟到的音频一律不许出声，否则会和降级后的百度/系统语音叠在一起 */
+        volatile boolean aborted = false;
 
         Job(String text, String next, String voice, float rate, Callback cb, int my) {
             this.text = text;
@@ -270,6 +275,9 @@ public class EdgeTtsEngine {
             this.my = my;
         }
     }
+
+    /** 单次合成的最长等待：超过就判失败，交给上层降级，绝不让队列无声干等 */
+    private static final long SYNTH_TIMEOUT_MS = 10_000L;
 
     /** 开关：句间无缝接续（关掉就退回每句完整新建播放器的老路径） */
     public void setSeamless(boolean on) {
@@ -371,9 +379,23 @@ public class EdgeTtsEngine {
         final ByteArrayOutputStream audio = new ByteArrayOutputStream();
         if (j.text.isEmpty()) { j.cb.onResult(true); return; }
 
+        final int gen = ++j.gen;
+        final WebSocket[] sock = { null };
+        // 合成卡住（服务端不回 turn.end、网络半断）时队列会一直干等，这里兜一刀
+        final Runnable timeout = () -> {
+            if (j.my != seq.get() || j.gen != gen || j.finished) return;
+            lastError = "EdgeTts:timeout";
+            j.aborted = true;
+            Log.w(TAG, "synth timeout after " + SYNTH_TIMEOUT_MS + "ms, len=" + j.text.length());
+            try { if (sock[0] != null) sock[0].close(1000, "timeout"); } catch (Throwable ignore) { }
+            if (!stopRequested) j.cb.onResult(false);
+        };
+        main.postDelayed(timeout, SYNTH_TIMEOUT_MS);
+
         client.newWebSocket(buildRequest(), new WebSocketListener() {
             @Override public void onOpen(WebSocket webSocket, Response response) {
                 if (j.my != seq.get()) { try { webSocket.close(1000, "stale"); } catch (Exception ignore) {} return; }
+                sock[0] = webSocket;
                 ws = webSocket;
                 sendConfig(webSocket);
                 sendSsml(webSocket, j.text, v, j.rate);
@@ -382,6 +404,7 @@ public class EdgeTtsEngine {
             @Override public void onMessage(WebSocket webSocket, String text) {
                 if (j.my != seq.get()) return;                  // 过期会话，丢弃
                 if (text != null && text.contains("Path:turn.end")) {
+                    j.finished = true;
                     webSocket.close(1000, "done");
                     playBytes(audio.toByteArray(), j);
                 }
@@ -394,11 +417,14 @@ public class EdgeTtsEngine {
 
             @Override public void onFailure(WebSocket webSocket, Throwable t, Response response) {
                 if (j.my != seq.get()) return;
+                if (j.finished) return;                         // 已由超时判过，别重复回调
+                j.finished = true;
                 int code = response != null ? response.code() : 0;
                 // 403 常见于本机时间不准：令牌按 5 分钟窗口计算，偏差过大会被拒。
                 // 用服务端 Date 头校正后重试一次。
                 if (code == 403 && !retried && correctClock(response)) {
                     Log.w(TAG, "403, clock corrected by " + EdgeGec.getClockSkew() + "s, retry");
+                    j.finished = false;
                     connect(j, true);
                     return;
                 }
@@ -427,7 +453,7 @@ public class EdgeTtsEngine {
     }
 
     private void playBytes(byte[] mp3, final Job j) {
-        if (j.my != seq.get()) return;
+        if (j.aborted || j.my != seq.get()) return;
         if (mp3 == null || mp3.length == 0) { j.cb.onResult(false); return; }
         final File f = new File(ctx.getCacheDir(), "edge_tts_" + j.my + ".mp3");
         try {
@@ -504,7 +530,7 @@ public class EdgeTtsEngine {
             final File pf = nxtFile;
             nxt = null; nxtFile = null; nxtKey = ""; nxtGen = -1;
             if (p == null) { speakFallback(j); return; }
-            if (j.my != seq.get()) { releaseOne(p); deleteQuiet(pf); return; }
+            if (j.my != seq.get() || j.aborted) { releaseOne(p); deleteQuiet(pf); return; }
             try {
                 if (player != null) releasePlayer();   // 上一句理论上已释放，这里是兜底：绝不允许两路同时出声
                 player = p;
