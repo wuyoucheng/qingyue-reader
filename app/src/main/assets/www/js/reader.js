@@ -2,10 +2,10 @@
  * reader.js — 阅读器核心：章节渲染、进度记录与恢复、目录跳转、朗读联动
  */
 
-import { db, newId } from './db.js?v=1.30';
-import { settings, saveSettings } from './settings.js?v=1.30';
-import { splitSentences } from './parser.js?v=1.30';
-import { Speaker } from './tts.js?v=1.30';
+import { db, newId } from './db.js?v=1.32';
+import { settings, saveSettings } from './settings.js?v=1.32';
+import { splitSentences } from './parser.js?v=1.32';
+import { Speaker } from './tts.js?v=1.32';
 
 const $ = id => document.getElementById(id);
 const esc = s => String(s).replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
@@ -184,6 +184,12 @@ export const reader = {
   /* ---------------- 打开书籍 ---------------- */
   async open(book) {
     this.book = book;
+    // 换书时上一本还在朗读：声音会继续念旧书，页面却已经是新书，停下来更符合预期。
+    // nativeState() 已按 bookId 过滤——同书重进会返回状态，不会被误停。
+    if (this.speaker && this.speaker.playing) {
+      const same = this.speaker.nativeState ? this.speaker.nativeState() : null;
+      if (!same) this.speaker.stop();
+    }
     this.titles = await db.getTitles(book.id);
     if (!this.titles.length) { this.toast('这本书没有章节数据'); return false; }
     this.charsBefore = [0];
@@ -344,12 +350,16 @@ export const reader = {
   async restoreTo(block, ratio, hold = true) {
     const sc = this.el.scroll;
     const pm = settings.scrollMode === 'page';
+    // 每次回位带上「代次」：快速连续切章时，上一章还在 await 的循环必须立刻放手，
+    // 否则它会把新章的位置顶到旧章的目标上（表现为"跳章后位置乱跑"）。
+    const seq = this._restoreSeq = (this._restoreSeq || 0) + 1;
     this._restoring = true;
     const delays = [0, 60, 150, 320, 650];
     let ok = false;
 
     for (let k = 0; k < delays.length && !ok; k++) {
       if (delays[k]) await new Promise(r => setTimeout(r, delays[k]));
+      if (seq !== this._restoreSeq) { this._restoring = false; return; }   // 已被更新的回位取代
       if (this._userScrolled) { this._diagPush('k' + k + ' 用户已滚动，放弃'); break; }
       if (k === 3 && document.fonts && document.fonts.ready) {
         try { await document.fonts.ready; } catch (e) {}
@@ -424,6 +434,8 @@ export const reader = {
   cancelRestore() {
     this._want = null;
     this._restoreDone = true;
+    this._restoreSeq = (this._restoreSeq || 0) + 1;   // 让正在 await 的回位循环立刻退出
+    this._restoring = false;
     this._hold = null;
     clearTimeout(this._retryTimer);
     clearInterval(this._holdTimer);
@@ -704,9 +716,12 @@ export const reader = {
       }
     }
 
-    // 原生队列才是真位置：后台连播会自己跨章，网页这边还冻在老章上
+    // 原生队列才是真位置：后台连播会自己跨章，网页这边还冻在老章上。
+    // 但只有「真的在播」或「暂停且停在当前这一章」时才采信——
+    // 否则用户暂停听书后手动翻到别处阅读，每次存进度都会被拉回听书的旧位置。
     const ns = this.speaker && this.speaker.nativeState ? this.speaker.nativeState() : null;
-    if (ns && (ns.playing || ns.paused) && ns.chapter >= 0 && ns.chapter < this.titles.length) {
+    const nativeTrusted = ns && (ns.playing || (ns.paused && ns.chapter === this.chapterIndex));
+    if (nativeTrusted && ns.chapter >= 0 && ns.chapter < this.titles.length) {
       const nIdx = ns.index || 0;
       if (ns.chapter !== chIdx || nIdx !== block) src = 'native';
       chIdx = ns.chapter;
