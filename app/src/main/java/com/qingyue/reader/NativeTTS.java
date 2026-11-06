@@ -56,7 +56,7 @@ public class NativeTTS {
     private volatile boolean builtinReady = false;
     private volatile String builtinErr = "";   // 内置引擎初始化失败原因（诊断用）
     private static final String BUILTIN_NAME = "小燕 · 离线女声";
-    private static final String APP_VER = "v1.28";
+    private static final String APP_VER = "v1.29";
 
     /* ---------------- 朗读进度落盘 ----------------
      * 后台连播时网页被系统冻结，它没法保存进度；App 被划掉/被杀时网页更没机会保存。
@@ -833,7 +833,7 @@ public class NativeTTS {
     /** 播放一句的统一入口：按当前音色 Edge → 百度 → 系统 依次降级，回调只表示「这句念完了」 */
     private interface Once { void onResult(boolean ok); }
 
-    private void playOnce(final String text, final Once cb, final int token) {
+    private void playOnce(final String text, final String nextText, final Once cb, final int token) {
         final String vid = voiceId == null ? DEFAULT_VOICE_ID : voiceId;
         final String clean = text == null ? "" : text.trim();
         if (clean.isEmpty()) { cb.onResult(true); return; }
@@ -847,7 +847,8 @@ public class NativeTTS {
             return;
         }
         if (vid.startsWith("edge:")) {
-            edge.speak(clean, voiceShortName(vid), rate, ok -> {
+            // 带上下一句：当前句还在念的时候，原生层就把下一句 prepare 好接棒
+            edge.speak(clean, nextText, voiceShortName(vid), rate, ok -> {
                 if (ok) { cb.onResult(true); return; }
                 edgeErr = edge.getLastError();
                 Log.w(TAG, "queue edge failed: " + edgeErr + ", try baidu");
@@ -1037,22 +1038,24 @@ public class NativeTTS {
 
         final int token = ++qToken;
         final String text = queue.get(i);
+        // 下一句交给原生层提前 prepare，播完直接接棒（跨章不接，跨章要整段换队列）
+        final String nextText = (i + 1 < queue.size()) ? queue.get(i + 1) : null;
         qIndex = i;
         saveQueuePos(false);          // 后台/被杀也留个位置（有节流，不会频繁写盘）
-        notifyProgress(true);
 
         if (text == null || text.trim().isEmpty()) {
+            notifyProgress(true);
             main.postDelayed(() -> { if (token == qToken) playAt(i + 1); }, 10);
             return;
         }
 
-        playOnce(text, ok -> {
+        playOnce(text, nextText, ok -> {
             if (token != qToken) return;             // 已被手动切句/停止
             if (!qPlaying || qPaused) return;
             if (ok) {
                 qErrStreak = 0;
-                // 上一句快念完了，下一句（多半已预取）几乎可以立刻接上，不留空窗
-                main.postDelayed(() -> { if (token == qToken) playAt(i + 1); }, 10);
+                // 上一句快念完了，下一句（多半已准备就绪）几乎可以立刻接上，不留空窗
+                main.post(() -> { if (token == qToken) playAt(i + 1); });
             } else {
                 qErrStreak++;
                 if (qErrStreak >= 4) {
@@ -1064,7 +1067,10 @@ public class NativeTTS {
             }
         }, token);
 
-        // 当前句已经在念了，趁这段时间把后面两句合成好（命中缓存的句子不再重复请求）
+        // 出声之后再更新高亮/进度：把主线程让给音频启动，少几十毫秒也是几十毫秒
+        main.post(() -> { if (token == qToken) notifyProgress(true); });
+
+        // 当前句已经在念了，趁这段时间把后面几句合成好（命中缓存的句子不再重复请求）
         prefetchAhead(i);
     }
 
@@ -1077,7 +1083,8 @@ public class NativeTTS {
         final String vid = voiceId == null ? DEFAULT_VOICE_ID : voiceId;
         if (!vid.startsWith("edge:")) return;        // 百度/系统音色没有预取通道
         final String v = voiceShortName(vid);
-        for (int k = i + 1; k <= i + 3; k++) {
+        // 多预取几句：无缝接续要「下一句已经躺在缓存里」，只有 3 句时一遇到长句/网络抖动就断档
+        for (int k = i + 1; k <= i + 5; k++) {
             String t;
             if (k < queue.size()) {
                 t = queue.get(k);
@@ -1344,6 +1351,17 @@ public class NativeTTS {
     public void setRate(float r) {
         rate = r;
         main.post(() -> { try { if (tts != null) tts.setSpeechRate(rate); } catch (Exception e) { /* ignore */ } });
+    }
+
+    /** 句间无缝接续开关（默认开）：关掉就退回每句重新建播放器的老行为 */
+    @JavascriptInterface
+    public void setSeamless(boolean on) {
+        main.post(() -> edge.setSeamless(on));
+    }
+
+    @JavascriptInterface
+    public boolean isSeamless() {
+        return edge.isSeamless();
     }
 
     @JavascriptInterface

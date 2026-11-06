@@ -2,11 +2,11 @@
  * app.js — 主控制器：书架、导入、目录、设置、听书面板、路由
  */
 
-import { db, newId, storageInfo } from './db.js?v=1.28';
-import { settings, saveSettings } from './settings.js?v=1.28';
-import { parseFile } from './parser.js?v=1.28';
-import { reader } from './reader.js?v=1.28';
-import { ttsSupported, isNativeApp } from './tts.js?v=1.28';
+import { db, newId, storageInfo } from './db.js?v=1.29';
+import { settings, saveSettings } from './settings.js?v=1.29';
+import { parseFile } from './parser.js?v=1.29';
+import { reader } from './reader.js?v=1.29';
+import { ttsSupported, isNativeApp } from './tts.js?v=1.29';
 
 const $ = id => document.getElementById(id);
 const GRADS = [
@@ -489,6 +489,13 @@ const app = {
       if (reader.speaker.playing) reader.speaker.requestWake(e.target.checked);
     });
     $('sw-follow').addEventListener('change', e => saveSettings({ follow: e.target.checked }));
+    const swSeam = $('sw-seamless');
+    if (swSeam) swSeam.addEventListener('change', e => {
+      saveSettings({ seamless: e.target.checked });
+      if (window.AndroidTTS && window.AndroidTTS.setSeamless) {
+        try { window.AndroidTTS.setSeamless(e.target.checked); } catch (err) { /* ignore */ }
+      }
+    });
 
     $('seg-font').addEventListener('click', e => {
       const b = e.target.closest('button'); if (!b) return;
@@ -522,6 +529,8 @@ const app = {
     $('sw-auto-next').checked = s.autoNext;
     $('sw-wake').checked = s.keepAwake;
     $('sw-follow').checked = s.follow;
+    const swS = $('sw-seamless');
+    if (swS) swS.checked = s.seamless !== false;
     document.querySelectorAll('#theme-picker button').forEach(b => b.classList.toggle('on', b.dataset.theme === s.theme));
     document.querySelectorAll('#seg-family button').forEach(b => b.classList.toggle('on', b.dataset.v === s.family));
     document.querySelectorAll('#seg-scroll button').forEach(b => b.classList.toggle('on', b.dataset.v === s.scrollMode));
@@ -613,6 +622,9 @@ const app = {
 
     this.openSheet('sheet-tts');
     this.fillVoices();
+    if (window.AndroidTTS && window.AndroidTTS.setSeamless) {
+      try { window.AndroidTTS.setSeamless(settings.seamless !== false); } catch (e) { /* ignore */ }
+    }
     const start = reader.currentBlock ? reader.currentBlock() : 0;
     sp.play(start, {
       rate: settings.ttsRate,

@@ -2,10 +2,10 @@
  * reader.js — 阅读器核心：章节渲染、进度记录与恢复、目录跳转、朗读联动
  */
 
-import { db, newId } from './db.js?v=1.28';
-import { settings, saveSettings } from './settings.js?v=1.28';
-import { splitSentences } from './parser.js?v=1.28';
-import { Speaker } from './tts.js?v=1.28';
+import { db, newId } from './db.js?v=1.29';
+import { settings, saveSettings } from './settings.js?v=1.29';
+import { splitSentences } from './parser.js?v=1.29';
+import { Speaker } from './tts.js?v=1.29';
 
 const $ = id => document.getElementById(id);
 const esc = s => String(s).replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
@@ -506,7 +506,7 @@ export const reader = {
     try { wlog = JSON.parse(localStorage.getItem('nr.wlog') || '[]'); } catch (e) {}
     const sc = this.el.scroll;
     const lines = [
-      '【阅读位置诊断 v1.28】',
+      '【阅读位置诊断 v1.29】',
       '书: ' + (this.book ? this.book.title : '-'),
       '当前: 第' + (this.chapterIndex + 1) + '章 block=' + this.currentBlock(),
       '滚动: top=' + Math.round(sc.scrollTop) + ' / max=' + Math.round(sc.scrollHeight - sc.clientHeight),
