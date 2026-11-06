@@ -2,11 +2,11 @@
  * app.js — 主控制器：书架、导入、目录、设置、听书面板、路由
  */
 
-import { db, newId, storageInfo } from './db.js';
-import { settings, saveSettings } from './settings.js';
-import { parseFile } from './parser.js';
-import { reader } from './reader.js';
-import { ttsSupported, isNativeApp } from './tts.js';
+import { db, newId, storageInfo } from './db.js?v=1.28';
+import { settings, saveSettings } from './settings.js?v=1.28';
+import { parseFile } from './parser.js?v=1.28';
+import { reader } from './reader.js?v=1.28';
+import { ttsSupported, isNativeApp } from './tts.js?v=1.28';
 
 const $ = id => document.getElementById(id);
 const GRADS = [
@@ -375,6 +375,11 @@ const app = {
       this.refreshShelf();
     });
     $('btn-catalog').addEventListener('click', () => this.openCatalog());
+    $('btn-mode').addEventListener('click', () => {
+      const now = reader.setMode(settings.scrollMode === 'page' ? 'scroll' : 'page');
+      this.syncSettingsUI();
+      this.toast(now === 'page' ? '翻页模式：左右点两侧 / 左右划屏 翻一页，点中间唤出菜单' : '已切换为上下滚动');
+    });
     $('btn-font').addEventListener('click', () => this.openSheet('sheet-settings'));
     $('btn-listen').addEventListener('click', () => this.startListen());
     $('btn-tts-open').addEventListener('click', () => this.startListen());
@@ -502,9 +507,9 @@ const app = {
     });
     $('seg-scroll').addEventListener('click', e => {
       const b = e.target.closest('button'); if (!b) return;
-      saveSettings({ scrollMode: b.dataset.v });
-      reader.applyStyle(); this.syncSettingsUI();
-      this.toast(b.dataset.v === 'page' ? '翻页模式：点左右两侧翻页，点中间唤出菜单' : '已切换为滚动模式');
+      const now = reader.setMode(b.dataset.v);
+      this.syncSettingsUI();
+      this.toast(now === 'page' ? '翻页模式：点左右两侧翻页，点中间唤出菜单' : '已切换为滚动模式');
     });
     this.syncSettingsUI();
   },
@@ -520,6 +525,14 @@ const app = {
     document.querySelectorAll('#theme-picker button').forEach(b => b.classList.toggle('on', b.dataset.theme === s.theme));
     document.querySelectorAll('#seg-family button').forEach(b => b.classList.toggle('on', b.dataset.v === s.family));
     document.querySelectorAll('#seg-scroll button').forEach(b => b.classList.toggle('on', b.dataset.v === s.scrollMode));
+    const pm = s.scrollMode === 'page';
+    const mb = $('btn-mode');
+    if (mb) {
+      const u = mb.querySelector('use');
+      if (u) u.setAttribute('href', pm ? '#i-roll' : '#i-flip');
+      mb.querySelector('span').textContent = pm ? '滚动' : '翻页';
+      mb.title = pm ? '当前：左右翻页，点击切换为上下滚动' : '当前：上下滚动，点击切换为左右翻页';
+    }
     document.querySelectorAll('#seg-timer button').forEach(b => b.classList.toggle('on', parseInt(b.dataset.v, 10) === s.timerMin));
     $('rng-rate').value = s.ttsRate; $('val-rate').textContent = s.ttsRate.toFixed(1);
     $('rng-pitch').value = s.ttsPitch; $('val-pitch').textContent = s.ttsPitch.toFixed(1);
