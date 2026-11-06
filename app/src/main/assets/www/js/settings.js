@@ -15,6 +15,7 @@ export const DEFAULTS = {
   ttsRate: 1,
   ttsPitch: 1,
   ttsVoice: '',
+  seamless: true,        // 句间无缝连读（原生层提前准备下一句）
   timerMin: 0,
   sortBy: 'recent',       // recent | title | added
   catalogDesc: false,     // 目录是否倒序（最新章节在上）
