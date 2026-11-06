@@ -258,6 +258,9 @@ export class Speaker {
       this.native.setRate(o.rate || 1);
       this.native.setPitch(o.pitch || 1);
       if (o.voiceURI) this.native.setVoice(o.voiceURI);
+      // 合并/无缝这类开关每次起播都同步一次，避免重启 App 后原生还停在默认值
+      if (this.native.setSeamless && typeof o.seamless === 'boolean') this.native.setSeamless(o.seamless);
+      if (this.native.setJoinShort && typeof o.joinShort === 'boolean') this.native.setJoinShort(o.joinShort);
       // 告诉原生是哪本书，它才能把朗读进度落盘（网页被冻结后靠它找回位置）
       if (this.native.setBookId && meta.bookId) this.native.setBookId(meta.bookId);
     } catch (e) { /* ignore */ }
