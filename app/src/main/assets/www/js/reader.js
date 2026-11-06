@@ -2,10 +2,10 @@
  * reader.js — 阅读器核心：章节渲染、进度记录与恢复、目录跳转、朗读联动
  */
 
-import { db, newId } from './db.js';
-import { settings, saveSettings } from './settings.js';
-import { splitSentences } from './parser.js';
-import { Speaker } from './tts.js';
+import { db, newId } from './db.js?v=1.28';
+import { settings, saveSettings } from './settings.js?v=1.28';
+import { splitSentences } from './parser.js?v=1.28';
+import { Speaker } from './tts.js?v=1.28';
 
 const $ = id => document.getElementById(id);
 const esc = s => String(s).replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
@@ -69,6 +69,8 @@ export const reader = {
     // 点击正文切换顶/底栏；翻页模式下左右翻页
     this.el.scroll.addEventListener('click', e => {
       if (e.target.closest('button')) return;
+      // 刚划过一页：浏览器随后补发的 click 别再翻一次
+      if (this._swipedAt && Date.now() - this._swipedAt < 400) return;
       if (settings.scrollMode === 'page') {
         const x = e.clientX, w = window.innerWidth;
         if (x < w * 0.3) return this.goPage(this.page - 1);
@@ -76,6 +78,24 @@ export const reader = {
       }
       this.toggleChrome();
     });
+
+    // 翻页模式下真正的手势：左右一划翻一页（跟点击相比更接近纸质书的手感）
+    let tx = 0, ty = 0, tt = 0;
+    this.el.scroll.addEventListener('touchstart', e => {
+      if (settings.scrollMode !== 'page' || e.touches.length !== 1) { tt = 0; return; }
+      const t = e.touches[0];
+      tx = t.clientX; ty = t.clientY; tt = Date.now();
+    }, { passive: true });
+    this.el.scroll.addEventListener('touchend', e => {
+      if (settings.scrollMode !== 'page' || !tt) return;
+      const t = e.changedTouches[0];
+      const dx = t.clientX - tx, dy = t.clientY - ty, dt = Date.now() - tt;
+      tt = 0;
+      // 只认「横向为主、够长、够快」的滑动；竖着划是误会，交还给滚动
+      if (dt > 700 || Math.abs(dx) < 40 || Math.abs(dx) < Math.abs(dy) * 1.4) return;
+      this._swipedAt = Date.now();
+      this.goPage(this.page + (dx < 0 ? 1 : -1));
+    }, { passive: true });
 
     let timer = null;
     this.el.scroll.addEventListener('scroll', () => {
@@ -321,7 +341,7 @@ export const reader = {
    * 部分安卓 WebView 甚至会忽略程序化 scrollTop。所以：
    *   1) 分多轮重试；2) 赋值不生效时让浏览器自己 scrollIntoView；3) 用比例兜底。
    */
-  async restoreTo(block, ratio) {
+  async restoreTo(block, ratio, hold = true) {
     const sc = this.el.scroll;
     const pm = settings.scrollMode === 'page';
     this._restoring = true;
@@ -337,7 +357,12 @@ export const reader = {
 
       if (pm) {
         this.measurePages(true);
-        if (this.pages <= 1) { this._diagPush('k' + k + ' 页数未测出'); continue; }
+        if (this.pages <= 1) {
+          // 整章一屏能放下：本来就该停在第 1 页；多等两轮就接受，别白耗时间
+          this._diagPush('k' + k + ' 页数未测出 p=' + this.pages);
+          if (k >= 2) ok = true;
+          continue;
+        }
         const el = block > 0 ? this.spans[block] : null;
         let p = el ? Math.round(el.offsetLeft / (this.step || 1)) : 0;
         // offsetLeft 在多列布局里不一定可靠，block 定位失败就用比例
@@ -382,7 +407,7 @@ export const reader = {
     this._userScrolled = false;
     this._restoreDone = ok;
     this._diagPush('恢复' + (ok ? '成功' : '失败') + ' 目标block=' + block + ' ratio=' + (ratio || 0).toFixed(3));
-    if (ok) this._holdPos(block, ratio);
+    if (ok && hold !== false) this._holdPos(block, ratio);
     this.afterRender();
 
     // 兜底：过 800ms 还没到位，再补一次（真机布局可能更慢）
@@ -481,7 +506,7 @@ export const reader = {
     try { wlog = JSON.parse(localStorage.getItem('nr.wlog') || '[]'); } catch (e) {}
     const sc = this.el.scroll;
     const lines = [
-      '【阅读位置诊断 v1.27】',
+      '【阅读位置诊断 v1.28】',
       '书: ' + (this.book ? this.book.title : '-'),
       '当前: 第' + (this.chapterIndex + 1) + '章 block=' + this.currentBlock(),
       '滚动: top=' + Math.round(sc.scrollTop) + ' / max=' + Math.round(sc.scrollHeight - sc.clientHeight),
@@ -582,6 +607,31 @@ export const reader = {
     this.el.content.style.transition = 'transform .22s ease';
     this.el.content.style.transform = `translateX(${-p * this.step}px)`;
     this.saveProgress();
+  },
+
+  /**
+   * 滚动 / 翻页 二选一切换。
+   * 换完必须停在同一句上：先量出当前句子和比例，改完版面再回位一次，
+   * 否则从滚动切到翻页会直接跳回章首（用户很容易以为丢进度了）。
+   */
+  setMode(mode) {
+    const next = mode === 'page' ? 'page' : 'scroll';
+    if (settings.scrollMode === next) return next;
+    const ready = !!(this.book && this.sentences && this.sentences.length && this.hasLayout());
+    const block = ready ? this.currentBlock() : 0;
+    const ratio = ready ? this.currentRatio() : 0;
+    saveSettings({ scrollMode: next });
+    this.cancelRestore();
+    this.applyStyle();
+    if (ready) {
+      this._want = { block, ratio };
+      this._restoreTries = 0;
+      this._restoreDone = false;
+      this._userScrolled = false;
+      // 不用 hold：切换是用户自己刚做的操作，按住位置反而会跟他的手势打架
+      this.restoreTo(block, ratio, false);
+    }
+    return next;
   },
 
   /* ---------------- 进度 ---------------- */
