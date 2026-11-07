@@ -2,10 +2,10 @@
  * reader.js — 阅读器核心：章节渲染、进度记录与恢复、目录跳转、朗读联动
  */
 
-import { db, newId } from './db.js?v=1.33';
-import { settings, saveSettings } from './settings.js?v=1.33';
-import { splitSentences } from './parser.js?v=1.33';
-import { Speaker } from './tts.js?v=1.33';
+import { db, newId } from './db.js?v=1.34';
+import { settings, saveSettings } from './settings.js?v=1.34';
+import { splitSentences } from './parser.js?v=1.34';
+import { Speaker } from './tts.js?v=1.34';
 
 const $ = id => document.getElementById(id);
 const esc = s => String(s).replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
@@ -292,8 +292,13 @@ export const reader = {
     this._holdTimer = null;
     clearTimeout(this._retryTimer);
     this._retryTimer = null;
+
+    // 换章窗口里 pages 和 translateX 都还是旧章的，这期间的翻页请求全部忽略，
+    // 否则会被算成「新章第 2 页」——用户看到的就是第 1 页被跳过。
+    this._navLockUntil = Date.now() + 400;
+
     const ch = await db.getChapter(this.book.id, index);
-    if (!ch) return;
+    if (!ch) { this._navLockUntil = 0; return; }
     this.chapter = ch;
     this.sentences = [];
     this.spans = [];
@@ -324,16 +329,44 @@ export const reader = {
     this.el.scroll.scrollTop = 0;
     this.page = 0;
     this._userScrolled = false;
+    // 多列翻页的 translateX 是「绝对页码」，不会随章节内容自动归零：
+    // 上一章末页的偏移留着，往后翻就像跳过了新章第 1 页；
+    // 往前翻则因为偏移恰好是 0，直接停在上一章第 1 页而不是最后一页。
+    if (settings.scrollMode === 'page') {
+      this.el.content.style.transition = 'none';
+      this.el.content.style.transform = 'translateX(0px)';
+    }
 
     const wantBlock = opt.block > 0 ? opt.block : 0;
     const wantRatio = opt.ratio > 0 ? opt.ratio : 0;
-    const needRestore = wantBlock > 0 || wantRatio > 0.02 || opt.restore;
-    this._want = needRestore ? { block: wantBlock, ratio: wantRatio } : null;
+    // opt.toEnd：跨章往回翻时停在上一章最后一页。
+    // 这里用「比例 1」定位而不是最后一句的 offsetLeft ——
+    // 末句可能是跨页的，按它的起点算会停到倒数第二页。
+    const toEnd = !!opt.toEnd && this.spans.length > 0;
+    const needRestore = wantBlock > 0 || wantRatio > 0.02 || opt.restore || toEnd;
+    this._want = needRestore
+      ? (toEnd ? { block: 0, ratio: 1 } : { block: wantBlock, ratio: wantRatio })
+      : null;
     this._restoreTries = 0;
     this._restoreDone = false;
 
-    if (needRestore) this.restoreTo(wantBlock, wantRatio);
-    else requestAnimationFrame(() => { requestAnimationFrame(() => this.afterRender()); });
+    if (needRestore) {
+      if (toEnd) this.restoreTo(0, 1, false);
+      else this.restoreTo(wantBlock, wantRatio);
+    } else {
+      requestAnimationFrame(() => { requestAnimationFrame(async () => {
+        // 换章后必须重测页数：goPage 的越界判断若沿用上一章的 pages，
+        // 点击一次就会直接落到第 2 页（新章第 1 页从没显示过）
+        if (settings.scrollMode === 'page') this.measurePages(true);
+        this._navLockUntil = 0;
+        this.afterRender();
+        // 字体晚到会改变每页容量，就绪后再校一次页数（不动当前页）
+        if (document.fonts && document.fonts.ready) {
+          try { await document.fonts.ready; } catch (e) {}
+          if (this.chapterIndex === index && settings.scrollMode === 'page') this.measurePages(true);
+        }
+      }); });
+    }
 
     if (this.speaker.playing) {
       // 句子表更新为当前显示章；index 由原生进度回调驱动，这里不重置
@@ -360,6 +393,8 @@ export const reader = {
     for (let k = 0; k < delays.length && !ok; k++) {
       if (delays[k]) await new Promise(r => setTimeout(r, delays[k]));
       if (seq !== this._restoreSeq) { this._restoring = false; return; }   // 已被更新的回位取代
+      // 回位没落定之前页码不可信，期间的翻页请求先压住（循环结束即释放）
+      this._navLockUntil = Date.now() + 400;
       if (this._userScrolled) { this._diagPush('k' + k + ' 用户已滚动，放弃'); break; }
       if (k === 3 && document.fonts && document.fonts.ready) {
         try { await document.fonts.ready; } catch (e) {}
@@ -416,6 +451,7 @@ export const reader = {
     this._restoring = false;
     this._userScrolled = false;
     this._restoreDone = ok;
+    this._navLockUntil = 0;      // 回位落定，放开翻页
     this._diagPush('恢复' + (ok ? '成功' : '失败') + ' 目标block=' + block + ' ratio=' + (ratio || 0).toFixed(3));
     if (ok && hold !== false) this._holdPos(block, ratio);
     this.afterRender();
@@ -434,6 +470,7 @@ export const reader = {
   cancelRestore() {
     this._want = null;
     this._restoreDone = true;
+    this._navLockUntil = 0;      // 主动操作优先，立刻放开翻页
     this._restoreSeq = (this._restoreSeq || 0) + 1;   // 让正在 await 的回位循环立刻退出
     this._restoring = false;
     this._hold = null;
@@ -602,14 +639,24 @@ export const reader = {
     } else {
       this.pages = Math.max(1, Math.round(c.scrollWidth / this.step));
     }
-    if (!stay) this.goPage(Math.min(this.page, this.pages - 1));
+    if (!stay) {
+      // 只把页码夹回有效范围，不走 goPage：避免被换章锁挡掉、或误取消正在进行的回位
+      const p = Math.max(0, Math.min(this.page, this.pages - 1));
+      if (p !== this.page) {
+        this.page = p;
+        this.el.content.style.transition = 'none';
+        this.el.content.style.transform = `translateX(${-p * this.step}px)`;
+      }
+    }
   },
 
   goPage(p) {
     if (settings.scrollMode !== 'page') return;
+    // 换章/回位还在进行：此刻 this.pages 与 translateX 属于上一章，翻页必然算错页
+    if (Date.now() < (this._navLockUntil || 0)) return;
     // 用户/代码主动翻页：不再自动按住旧位置，也取消还没跑完的回位重试
     this.cancelRestore();
-    if (p < 0) { if (this.chapterIndex > 0) this.loadChapter(this.chapterIndex - 1, { toTop: true }); return; }
+    if (p < 0) { if (this.chapterIndex > 0) this.loadChapter(this.chapterIndex - 1, { toEnd: true }); return; }
     if (p >= this.pages) {
       if (this.chapterIndex + 1 < this.titles.length) this.loadChapter(this.chapterIndex + 1, { toTop: true });
       else this.toast('已经是最后一章');
